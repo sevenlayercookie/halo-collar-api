@@ -335,7 +335,9 @@ change independently of this package.
 
 Nothing here is implemented. Everything in the first two groups is unspecified from
 API behavior or response payloads currently support, not from documentation, so treat the
-request shapes as unknown until support is added.
+request shapes as unknown until support is added. The SignalR entry under
+"Beyond REST" is the exception: its handshake and message shapes were captured in
+full and are documented below.
 
 ### Blocked on hardware or conditions we could not reproduce
 
@@ -375,11 +377,35 @@ endpoint exists to set them:
 
 ### Beyond REST
 
-- **SignalR.** The apps hold `TelemetryHub` and `NotificationHub` websockets open
-  against `halo-prod-sockets-app.azurewebsites.net`. Today the only way to follow
-  a dog with this client is polling `account_map()`, which the app itself does
-  every 16 seconds; subscribing would replace that with pushes and cut load on
-  Halo.
+- **SignalR live telemetry.** The highest-value item, and the only one here whose
+  protocol is already fully supported rather than unspecified, so it needs no further
+  development. Today the only way to follow a dog is polling
+  `account_map()`, which the app itself does every 16 seconds; the socket pushes
+  position roughly every 5 seconds instead.
+
+  The apps use Azure SignalR Service's redirect handshake:
+
+  1. `POST https://halo-prod-sockets-app.azurewebsites.net/{TelemetryHub,NotificationHub}/negotiate?negotiateVersion=1`
+     with the normal Halo bearer token. The response carries a
+     `halo-prod-signalr.service.signalr.net` URL plus a separate short-lived
+     `accessToken` for that service.
+  2. `POST` that URL's `/negotiate` with the returned token to get a connection id.
+  3. Open the `wss://` URL and send the handshake frame
+     `{"protocol":"json","version":1}` terminated by `0x1e`, which also separates
+     every later frame.
+
+  The connection is receive-only past the handshake — the client never invokes
+  anything — so a consumer only has to dispatch three server methods:
+  `HandleIoTTelemetry` (the frequent one: `collarSerialNumber`, `petId`,
+  `collarTelemetry`, and a `petTelemetry` object with `latitude`, `longitude`,
+  `speed`, `orientation`, `activityType`, `safetyStatus`, `geoFence`, `beacon`,
+  and a `manifest` with `sequenceCode` for ordering), `HandleDataStateChanged`,
+  and `HandleCollarDataSynchronized`.
+
+- **Halo Dog Park.** `app-dogpark-halo-prod.azurewebsites.net` is a separate
+  service that takes the same bearer token; `GET /configuration` returns chat and
+  scheduling settings. Note that this client already requests the `api.dogpark`
+  OAuth scope at login but never uses it.
 - **BLE.** Rolling codes and direct collar communication, used when the collar is
   in range and for setup.
 - **Training content.** `training_course_link()` returns a SCORM launch URL that
