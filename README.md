@@ -246,9 +246,9 @@ is a JSON-encoded *string* that must be parsed a second time.
 
 ### Not implemented
 
-The apps also open SignalR websockets to `halo-prod-sockets-app.azurewebsites.net`
-(`TelemetryHub` and `NotificationHub`) for live telemetry pushes. This client is
-REST-only and does not implement them.
+This client is REST-only. The apps also open SignalR websockets for live
+telemetry, talk to the collar over BLE, and drive flows we could not reproduce
+without extra hardware. See the [Roadmap](#roadmap) for what is missing and why.
 
 ## Send a correction
 
@@ -330,6 +330,73 @@ with HaloClient() as halo:
 
 Read responses remain dictionaries because the reverse-engineered schema can
 change independently of this package.
+
+## Roadmap
+
+Nothing here is implemented. Everything in the first two groups is inferred from
+traffic or response payloads we did capture, not from documentation, so treat the
+request shapes as unknown until someone captures them.
+
+### Blocked on hardware or conditions we could not reproduce
+
+- **Walk recording.** `GET /walk/my` is covered, but starting and finishing a walk
+  needs a working Bluetooth link to the collar; our attempt never connected, so no
+  walk-creation traffic was ever produced.
+- **Beacon mutations.** `GET /beacon/my` returns `availableRanges`, `beacons`, and
+  `defaultRange`, but with no beacon hardware on the account there was nothing to
+  add, rename, or remove.
+- **Collar provisioning.** Pairing a collar, binding it to a pet, and unbinding or
+  deleting one. The app exposes all of these, and a pet carries
+  `isCollarBindingToPetSynchronized` and `isCollarEverAssigned`, but our second pet
+  had no collar to attach.
+
+### Implied by captured payloads, never observed being changed
+
+These fields come back on `GET`s the client already supports, which means an
+endpoint exists to set them:
+
+- **Pet mode.** `mode.fencesOn` / `mode.beaconsOn`, alongside `desiredMode` and
+  `desiredModeUpdated`. Turning containment off remotely is safety-relevant and
+  deserves the same care as a correction.
+- **Fence assignment.** `currentGeoFenceId` selects which fence applies to a pet;
+  fence CRUD is covered but choosing the active one is not.
+- **Correction rule editing.** `GET /pet/{id}/correction-rules` and
+  `/correction-rule/configuration-v2` are read-only here. Writing them changes
+  what the collar does to the dog, so it warrants confirmation comparable to
+  `send_instant_correction`.
+- **Collar network settings.** `wiFiExtendedSettings` and
+  `cellularExtendedSettings`.
+- **Firmware updates.** `hasFirmwareUpdatesAvailable` and `firmwareUpdate`; the
+  firmware feature list also advertises `fota`.
+- **Calibration.** The firmware advertises `gpscalibration`,
+  `compasscalibration`, and `manualgpscalibration`.
+- **Pet deletion**, and account/profile edits implied by `hasChangeEmailRequest`,
+  `hasCompletedQuestionnaire`, and `hasFinishedUserGuide`.
+
+### Beyond REST
+
+- **SignalR.** The apps hold `TelemetryHub` and `NotificationHub` websockets open
+  against `halo-prod-sockets-app.azurewebsites.net`. Today the only way to follow
+  a dog with this client is polling `account_map()`, which the app itself does
+  every 16 seconds; subscribing would replace that with pushes and cut load on
+  Halo.
+- **BLE.** Rolling codes and direct collar communication, used when the collar is
+  in range and for setup.
+- **Training content.** `training_course_link()` returns a SCORM launch URL that
+  sets CloudFront signed cookies; the videos behind it are HLS with AES keys
+  under separate signed URLs. Downloading them means following that chain rather
+  than calling an API.
+
+### Client ergonomics
+
+- Pagination helpers that iterate `walks()` and `notifications()` instead of
+  making callers track `pageNumber` against `totalNumberOfPages`.
+- Typed models. Responses are deliberately plain dictionaries today because the
+  schema is reverse-engineered and can change without notice; typing them is
+  worthwhile once the shapes prove stable.
+- An async client, since the sync one is a thin wrapper over HTTPX.
+- A retry policy for reads. The no-retry rule exists to protect corrections and
+  other mutations; idempotent `GET`s could safely back off and retry.
 
 ## Development
 
