@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -48,6 +49,7 @@ class HaloClient:
         store: StateStore | None = None,
         timezone_name: str | None = None,
         app_instance_id: str | None = None,
+        amplitude_session_id: str | None = None,
         client_id: str | None = None,
         app_version: str | None = None,
         http: httpx.Client | None = None,
@@ -76,6 +78,12 @@ class HaloClient:
         )
         self.app_instance_id = (
             app_instance_id or settings.get("app_instance_id") or str(uuid.uuid4())
+        )
+        # The apps send the session's start time in milliseconds. It only feeds
+        # Halo's analytics, but sending it keeps requests shaped like the client
+        # whose API behavior this library was compatible with.
+        self.amplitude_session_id = amplitude_session_id or str(
+            int(datetime.now(timezone.utc).timestamp() * 1000)
         )
         stored_app_version = (
             stored_auth.get("app_version") if stored_client_id == self.client_id else None
@@ -163,6 +171,360 @@ class HaloClient:
         return self._get_object(
             f"/pet/{_identifier(pet_id)}/",
             params={"RefreshTelemetry": str(refresh_telemetry)},
+        )
+
+    def pets(self) -> list[dict[str, Any]]:
+        """List pets on the account, each with its embedded collar information."""
+
+        value = self._request_json("GET", "/pet/my")
+        if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+            raise HaloAPIError("Halo returned an unexpected pet list.")
+        return value
+
+    def account_map(
+        self,
+        latitude: float,
+        longitude: float,
+        *,
+        refresh_telemetry: bool = False,
+        max_corrections_count: int = 20,
+    ) -> dict[str, Any]:
+        """Fetch the aggregate view the app renders on its map screen.
+
+        One response returns ``pets`` (each with its collar embedded),
+        ``geoFencesInfo``, and ``corrections``, so prefer this over several
+        separate calls when polling.
+        """
+
+        return self._get_object(
+            "/account/my/map",
+            params={
+                "viewport.center.latitude": str(float(latitude)),
+                "viewport.center.longitude": str(float(longitude)),
+                "RefreshTelemetry": str(refresh_telemetry),
+                "MaxCorrectionsCount": str(
+                    _positive(max_corrections_count, "max_corrections_count")
+                ),
+            },
+        )
+
+    def walks(self, *, page: int = 1, page_size: int = 30) -> dict[str, Any]:
+        """Fetch one page of recorded walks."""
+
+        return self._get_object(
+            "/walk/my",
+            params={
+                "page": str(_positive(page, "page")),
+                "pageSize": str(_positive(page_size, "page_size")),
+            },
+        )
+
+    def notifications(self, *, page: int = 1, page_size: int = 30) -> dict[str, Any]:
+        """Fetch one page of the account's notification history.
+
+        Halo capitalizes this endpoint's paging parameters even though the
+        otherwise identical ``/walk/my`` envelope uses lowercase ones.
+        """
+
+        return self._get_object(
+            "/notification/my/query",
+            params={
+                "Page": str(_positive(page, "page")),
+                "PageSize": str(_positive(page_size, "page_size")),
+            },
+        )
+
+    def mapbox_requests(self) -> dict[str, Any] | list[Any]:
+        value = self._request_json("GET", "/mapbox/request/my")
+        if not isinstance(value, (dict, list)):
+            raise HaloAPIError("Halo returned an unexpected mapbox request response.")
+        return value
+
+    def pet_colors(self) -> list[dict[str, Any]]:
+        """List the collar colors that may be assigned to a pet."""
+
+        value = self._request_json("GET", "/pet/colors")
+        if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+            raise HaloAPIError("Halo returned an unexpected pet color list.")
+        return value
+
+    def correction_rule_configuration(self) -> dict[str, Any]:
+        """Fetch the sound/vibration intensity ladders corrections are built from."""
+
+        return self._get_object("/correction-rule/configuration-v2")
+
+    def pet_correction_rules(self, pet_id: str) -> dict[str, Any]:
+        """Fetch the configured correction rules for one pet."""
+
+        return self._get_object(f"/pet/{_identifier(pet_id)}/correction-rules")
+
+    def training(self) -> dict[str, Any]:
+        """Fetch training course progress for the account."""
+
+        return self._get_object("/training/my-v2")
+
+    def training_course_link(self, curriculum_id: str, course_name: str) -> str:
+        """Get a one-time launch URL for a training course.
+
+        Halo hosts the courses on SCORM Cloud rather than serving them itself,
+        so this returns an external URL as a bare JSON string.
+        """
+
+        path = (
+            f"/training/user/course-launch-link/"
+            f"{_identifier(curriculum_id)}/{_identifier(course_name)}"
+        )
+        value = self._request_json("GET", path)
+        if not isinstance(value, str) or not value:
+            raise HaloAPIError("Halo returned an unexpected course launch link.")
+        return value
+
+    def set_notification_status(
+        self,
+        notification_ids: Sequence[str],
+        *,
+        status: str = "Read",
+    ) -> None:
+        """Mark notifications read or unread."""
+
+        identifiers = [_identifier(item) for item in notification_ids]
+        if not identifiers:
+            raise ValueError("At least one notification id is required.")
+        self._request(
+            "PUT",
+            "/notification/status",
+            json_body={"Ids": identifiers, "Status": _required(status, "status")},
+        )
+
+    def generate_ecommerce_login_magic_code(self) -> dict[str, Any]:
+        """Mint a single-use code that signs this account into the Halo store.
+
+        The returned value is a credential: anyone holding it can act as this
+        account in the store, so treat it like a password and do not log it.
+        """
+
+        return self._post_object("/account/generate-ecommerce-login-magic-code")
+
+    def lookup_parcels(
+        self,
+        latitude: float,
+        longitude: float,
+        *,
+        page: int = 1,
+        results_per_page: int = 1,
+    ) -> dict[str, Any]:
+        """Look up public land-parcel records at a point, as the fence editor does.
+
+        Halo proxies a third-party property database here. Responses contain
+        real-world owner names and mailing addresses for whoever owns the land,
+        so avoid storing or printing them casually. The envelope's ``body`` is a
+        JSON-encoded *string* that must be parsed a second time.
+        """
+
+        return self._post_object(
+            "/report-all/api/parcels",
+            json_body={
+                "spatial_intersect": (
+                    f"POINT({_coordinate(longitude, 'longitude', 180.0)} "
+                    f"{_coordinate(latitude, 'latitude', 90.0)})"
+                ),
+                "rpp": _positive(results_per_page, "results_per_page"),
+                "page": _positive(page, "page"),
+                "si_srid": 4326,
+                "v": 8,
+            },
+        )
+
+    def find_collar(self, collar_id: str) -> None:
+        """Ask a collar to play its locate tone.
+
+        This is a physical action on the collar, but an audible-only one; unlike
+        a correction it is not aversive, so no command number is reserved. Halo
+        answers ``204 No Content``.
+        """
+
+        self._request("PUT", f"/collar/{_identifier(collar_id)}/find")
+
+    def pet_name_is_available(self, name: str, *, pet_id: str | None = None) -> bool:
+        """Return whether a pet name is free.
+
+        Pass ``pet_id`` when renaming so the pet does not collide with itself.
+        """
+
+        return self._name_is_available("/pet/check-name-uniqueness", name, pet_id)
+
+    def add_pet(
+        self,
+        *,
+        name: str,
+        color_hex: str,
+        breed: str,
+        birthday: datetime | str,
+        weight_kg: float,
+    ) -> dict[str, Any]:
+        """Create a pet.
+
+        The new pet has no collar; Halo returns it with ``collarInfo`` null until
+        one is bound. ``color_hex`` must be one of :meth:`pet_colors`.
+        """
+
+        return self._post_object(
+            "/pet/add",
+            json_body=_pet_body(name, color_hex, breed, birthday, weight_kg),
+        )
+
+    def update_pet(
+        self,
+        pet_id: str,
+        *,
+        name: str,
+        color_hex: str,
+        breed: str,
+        birthday: datetime | str,
+        weight_kg: float,
+    ) -> dict[str, Any]:
+        """Replace one pet's profile.
+
+        Halo treats this as a full replacement rather than a patch, so every
+        field is required; read :meth:`pet` first and pass back the values you
+        are not changing. Saving marks the collar's configuration ``outdated``
+        until it next syncs.
+        """
+
+        return self._put_object(
+            f"/pet/{_identifier(pet_id)}",
+            json_body=_pet_body(name, color_hex, breed, birthday, weight_kg),
+        )
+
+    def geo_fence_safe_zones(
+        self,
+        location_points: Sequence[tuple[float, float]],
+        *,
+        analytics: dict[str, Any] | None = None,
+    ) -> list[Any]:
+        """Preview the safe zone Halo derives from a drawn boundary.
+
+        The app calls this while the user drags fence points, before saving.
+        """
+
+        value = self._request_json(
+            "POST",
+            "/geo-fence/safe-zones",
+            json_body={
+                "LocationPoints": _location_points(location_points),
+                "Analytics": analytics,
+            },
+        )
+        if not isinstance(value, list):
+            raise HaloAPIError("Halo returned an unexpected safe-zone response.")
+        return value
+
+    def geo_fence_name_is_available(
+        self,
+        name: str,
+        *,
+        geo_fence_id: str | None = None,
+    ) -> bool:
+        """Return whether a fence name is free.
+
+        Pass ``geo_fence_id`` when renaming so the fence does not collide with
+        its own current name.
+        """
+
+        return self._name_is_available(
+            "/geo-fence/check-name-uniqueness",
+            name,
+            geo_fence_id,
+        )
+
+    def add_geo_fence(
+        self,
+        name: str,
+        location_points: Sequence[tuple[float, float]],
+        *,
+        public_visibility_type: str = "Private",
+        analytics: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create a containment fence.
+
+        This changes where the collar will correct the dog. Verify the boundary
+        before saving; the app calls :meth:`geo_fence_safe_zones` first.
+        """
+
+        return self._post_object(
+            "/geo-fence/add",
+            json_body={
+                "Name": _required(name, "name"),
+                "LocationPoints": _location_points(location_points),
+                "PublicVisibilityType": public_visibility_type,
+                "Analytics": analytics,
+            },
+        )
+
+    def rename_geo_fence(self, geo_fence_id: str, name: str) -> None:
+        """Rename a fence without touching its boundary."""
+
+        self._request(
+            "PUT",
+            f"/geo-fence/{_identifier(geo_fence_id)}",
+            json_body={"Name": _required(name, "name")},
+        )
+
+    def update_geo_fence_location(
+        self,
+        geo_fence_id: str,
+        location_points: Sequence[tuple[float, float]],
+        *,
+        analytics: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Move a fence's boundary.
+
+        The new boundary replaces the old one outright and takes effect once the
+        collar syncs, so a mistake here can leave a dog uncontained.
+        """
+
+        return self._put_object(
+            f"/geo-fence/{_identifier(geo_fence_id)}/location",
+            json_body={
+                "LocationPoints": _location_points(location_points),
+                "Analytics": analytics,
+            },
+        )
+
+    def delete_geo_fence(self, geo_fence_id: str) -> dict[str, Any]:
+        """Delete a containment fence.
+
+        Removing the boundary that keeps a dog contained is destructive and is
+        not reversible from this client; Halo does not return the deleted
+        geometry, so re-drawing it is manual. Confirm with the owner first.
+        """
+
+        return self._request_json("DELETE", f"/geo-fence/{_identifier(geo_fence_id)}")
+
+    def subscribe_push_notifications(
+        self,
+        device_handle: str,
+        *,
+        platform_type: str = "Android",
+    ) -> None:
+        """Register a push token so Halo delivers notifications to it."""
+
+        self._request(
+            "PUT",
+            "/push-notification/subscribe",
+            json_body={
+                "PlatformType": platform_type,
+                "DeviceHandle": _required(device_handle, "device_handle"),
+            },
+        )
+
+    def unsubscribe_push_device(self, device_handle: str) -> None:
+        """Stop Halo from delivering push notifications to one device token."""
+
+        self._request(
+            "PUT",
+            "/push-notification/unsubscribe-device",
+            json_body={"DeviceHandle": _required(device_handle, "device_handle")},
         )
 
     def user_profile(self) -> dict[str, Any]:
@@ -310,6 +672,41 @@ class HaloClient:
             raise HaloAPIError(f"Halo returned an unexpected response for {path}.")
         return value
 
+    def _name_is_available(self, path: str, name: str, identifier: str | None) -> bool:
+        """Ask one of Halo's name-uniqueness endpoints, which answer 204 or 409."""
+
+        response = self._request(
+            "PUT",
+            path,
+            json_body={
+                "Id": _identifier(identifier) if identifier is not None else None,
+                "Name": _required(name, "name"),
+            },
+            raise_for_status=False,
+        )
+        if response.status_code == 409:
+            return False
+        if response.is_error:
+            raise HaloAPIError(
+                f"Halo API request failed with HTTP {response.status_code}.",
+                status_code=response.status_code,
+                method="PUT",
+                path=path,
+            )
+        return True
+
+    def _post_object(self, path: str, **kwargs: Any) -> dict[str, Any]:
+        return self._mutate_object("POST", path, **kwargs)
+
+    def _put_object(self, path: str, **kwargs: Any) -> dict[str, Any]:
+        return self._mutate_object("PUT", path, **kwargs)
+
+    def _mutate_object(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        value = self._request_json(method, path, **kwargs)
+        if not isinstance(value, dict):
+            raise HaloAPIError(f"Halo returned an unexpected response for {path}.")
+        return value
+
     def _request_json(self, method: str, path: str, **kwargs: Any) -> Any:
         return self._decode_json(self._request(method, path, **kwargs))
 
@@ -331,6 +728,7 @@ class HaloClient:
         headers = {
             "Halo-Client": self.halo_client_header,
             "Halo-ParallelCall-Version": self._parallel_call_version,
+            "Halo-Amplitude-SessionId": self.amplitude_session_id,
         }
         if authenticated:
             if self.tokens is None:
@@ -394,6 +792,68 @@ def _identifier(value: str) -> str:
     allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
     if not value or any(character not in allowed for character in value):
         raise ValueError("Halo identifiers may contain only ASCII letters, digits, and hyphens.")
+    return value
+
+
+def _positive(value: int, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"{name} must be an integer of at least 1.")
+    return value
+
+
+def _pet_body(
+    name: str,
+    color_hex: str,
+    breed: str,
+    birthday: datetime | str,
+    weight_kg: float,
+) -> dict[str, Any]:
+    """Build the profile body shared by pet creation and replacement."""
+
+    return {
+        "Name": _required(name, "name"),
+        "ColorHex": _required(color_hex, "color_hex"),
+        "Breed": _required(breed, "breed"),
+        # Seconds precision, matching the API; Halo normalizes the
+        # value to UTC in its response either way.
+        "Birthday": (
+            birthday.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            if isinstance(birthday, datetime)
+            else birthday
+        ),
+        "WeightKg": float(weight_kg),
+    }
+
+
+def _coordinate(value: float, name: str, limit: float) -> float:
+    number = float(value)
+    if number != number or abs(number) > limit:
+        raise ValueError(f"{name} must be a real number within +/-{limit:g} degrees.")
+    return number
+
+
+def _location_points(points: Sequence[tuple[float, float]]) -> list[dict[str, float]]:
+    """Convert (latitude, longitude) pairs into Halo's boundary point objects.
+
+    A fence is an area, so Halo needs at least three corners; sending fewer
+    would define no enclosure at all.
+    """
+
+    result = [
+        {
+            "Latitude": _coordinate(latitude, "latitude", 90.0),
+            "Longitude": _coordinate(longitude, "longitude", 180.0),
+        }
+        for latitude, longitude in points
+    ]
+    if len(result) < 3:
+        raise ValueError("A fence boundary needs at least three location points.")
+    return result
+
+
+def _required(value: str, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} is required.")
     return value
 
 

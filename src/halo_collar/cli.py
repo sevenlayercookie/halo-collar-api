@@ -81,9 +81,58 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("configuration", help="Fetch public Halo configuration.")
     subparsers.add_parser("collars", help="List collars on the account.")
 
+    subparsers.add_parser("pets", help="List pets with their collar information.")
+
     pet = subparsers.add_parser("pet", help="Fetch one pet.")
     pet.add_argument("pet_id")
     pet.add_argument("--refresh-telemetry", action="store_true")
+
+    account_map = subparsers.add_parser(
+        "map",
+        help="Fetch pets, fences, and recent corrections in one call.",
+    )
+    account_map.add_argument("latitude", type=float)
+    account_map.add_argument("longitude", type=float)
+    account_map.add_argument("--refresh-telemetry", action="store_true")
+    account_map.add_argument("--max-corrections", type=int, default=20)
+
+    walks = subparsers.add_parser("walks", help="List recorded walks.")
+    walks.add_argument("--page", type=int, default=1)
+    walks.add_argument("--page-size", type=int, default=30)
+
+    notifications = subparsers.add_parser("notifications", help="List notification history.")
+    notifications.add_argument("--page", type=int, default=1)
+    notifications.add_argument("--page-size", type=int, default=30)
+
+    subparsers.add_parser("training", help="Show training course progress.")
+    subparsers.add_parser("pet-colors", help="List assignable collar colors.")
+
+    rules = subparsers.add_parser("correction-rules", help="Show a pet's correction rules.")
+    rules.add_argument("pet_id")
+
+    mark_read = subparsers.add_parser("notifications-read", help="Mark notifications read.")
+    mark_read.add_argument("notification_id", nargs="+")
+
+    rename_fence = subparsers.add_parser("fence-rename", help="Rename a fence.")
+    rename_fence.add_argument("fence_id")
+    rename_fence.add_argument("name")
+
+    delete_fence = subparsers.add_parser(
+        "fence-delete",
+        help="Delete a containment fence (destructive).",
+    )
+    delete_fence.add_argument("fence_id")
+    delete_fence.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the interactive confirmation.",
+    )
+
+    find = subparsers.add_parser(
+        "find-collar",
+        help="Play the collar's locate tone (audible only, not a correction).",
+    )
+    find.add_argument("collar_id")
 
     correction = subparsers.add_parser(
         "correct",
@@ -130,8 +179,40 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _print_json(client.configuration())
             elif args.command == "collars":
                 _print_json(_safe_collar_summary(client.collars()))
+            elif args.command == "pets":
+                _print_json(client.pets())
             elif args.command == "pet":
                 _print_json(client.pet(args.pet_id, refresh_telemetry=args.refresh_telemetry))
+            elif args.command == "map":
+                _print_json(
+                    client.account_map(
+                        args.latitude,
+                        args.longitude,
+                        refresh_telemetry=args.refresh_telemetry,
+                        max_corrections_count=args.max_corrections,
+                    )
+                )
+            elif args.command == "walks":
+                _print_json(client.walks(page=args.page, page_size=args.page_size))
+            elif args.command == "notifications":
+                _print_json(client.notifications(page=args.page, page_size=args.page_size))
+            elif args.command == "training":
+                _print_json(client.training())
+            elif args.command == "pet-colors":
+                _print_json(client.pet_colors())
+            elif args.command == "correction-rules":
+                _print_json(client.pet_correction_rules(args.pet_id))
+            elif args.command == "notifications-read":
+                client.set_notification_status(args.notification_id)
+                print(f"Marked {len(args.notification_id)} notification(s) read.")
+            elif args.command == "fence-rename":
+                client.rename_geo_fence(args.fence_id, args.name)
+                print(f"Fence renamed to {args.name}.")
+            elif args.command == "fence-delete":
+                return _delete_fence(args, client)
+            elif args.command == "find-collar":
+                client.find_collar(args.collar_id)
+                print("Halo accepted the locate request. The collar plays its tone if reachable.")
             elif args.command == "correct":
                 return _correct(args, client)
         return 0
@@ -149,6 +230,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     except KeyboardInterrupt:
         print("\nCancelled.", file=sys.stderr)
+        return 130
+    except EOFError:
+        # A confirmation prompt that cannot be answered must never be treated as
+        # consent, so closed stdin cancels rather than proceeding.
+        print("Cancelled: confirmation could not be read from input.", file=sys.stderr)
         return 130
 
 
@@ -278,6 +364,21 @@ def _correct(args: argparse.Namespace, client: HaloClient) -> int:
     )
     if result.get("currentCommandNumber") is not None:
         print(f"Halo current command number: {result['currentCommandNumber']}")
+    return 0
+
+
+def _delete_fence(args: argparse.Namespace, client: HaloClient) -> int:
+    if not args.yes:
+        print(
+            f"\nThis permanently deletes fence {args.fence_id}. Halo does not return the "
+            "deleted boundary, so re-drawing it is manual, and any dog relying on it for "
+            "containment loses that boundary once the collar syncs."
+        )
+        if input("Type the fence id to delete it: ").strip() != args.fence_id:
+            print("Cancelled; the fence was not deleted.")
+            return 1
+    client.delete_geo_fence(args.fence_id)
+    print("Fence deleted.")
     return 0
 
 

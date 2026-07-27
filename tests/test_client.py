@@ -11,6 +11,7 @@ from halo_collar import (
     IOS_CLIENT_SECRET,
     CorrectionOutcomeUnknownError,
     CorrectionType,
+    HaloAPIError,
     HaloClient,
     LoginRequiredError,
     StaleCommandNumberError,
@@ -367,3 +368,321 @@ def test_invalid_refresh_clears_only_tokens(tmp_path) -> None:
     with pytest.raises(LoginRequiredError):
         store.load_tokens()
     assert store.auth_profile()["client_id"] == "halo.app.android"
+
+
+def _stub_client(tmp_path, handler) -> HaloClient:
+    return HaloClient(
+        client_secret="secret",
+        tokens=tokens(),
+        store=StateStore(tmp_path / "state.json"),
+        app_instance_id="app-instance",
+        amplitude_session_id="1785108819973",
+        http=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+
+def test_account_map_sends_the_captured_viewport_parameters(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"pets": []})
+
+    client = _stub_client(tmp_path, handler)
+    assert client.account_map(37.4219983, -122.084) == {"pets": []}
+
+    query = parse_qs(requests[0].url.query.decode())
+    assert query == {
+        "viewport.center.latitude": ["37.4219983"],
+        "viewport.center.longitude": ["-122.084"],
+        "RefreshTelemetry": ["False"],
+        "MaxCorrectionsCount": ["20"],
+    }
+    assert requests[0].headers["Halo-Amplitude-SessionId"] == "1785108819973"
+
+
+def test_paged_endpoints_use_halos_inconsistent_parameter_casing(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"results": []})
+
+    client = _stub_client(tmp_path, handler)
+    client.walks(page=2, page_size=10)
+    client.notifications(page=3, page_size=5)
+
+    assert parse_qs(requests[0].url.query.decode()) == {"page": ["2"], "pageSize": ["10"]}
+    assert parse_qs(requests[1].url.query.decode()) == {"Page": ["3"], "PageSize": ["5"]}
+
+
+@pytest.mark.parametrize("bad", [0, -1, True])
+def test_paging_rejects_values_halo_would_not_accept(tmp_path, bad) -> None:
+    client = _stub_client(tmp_path, lambda _: httpx.Response(200, json={}))
+    with pytest.raises(ValueError):
+        client.walks(page=bad)
+
+
+def test_find_collar_puts_an_empty_body_and_tolerates_204(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    client = _stub_client(tmp_path, handler)
+    assert client.find_collar("11111111-1111-4111-8111-111111111111") is None
+    assert requests[0].method == "PUT"
+    assert requests[0].url.path == "/collar/11111111-1111-4111-8111-111111111111/find"
+    assert requests[0].content == b""
+
+
+def test_find_collar_rejects_path_injection(tmp_path) -> None:
+    client = _stub_client(tmp_path, lambda _: httpx.Response(204))
+    with pytest.raises(ValueError):
+        client.find_collar("../pet/x/run-instant-correction")
+
+
+def test_push_subscription_matches_the_captured_bodies(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={})
+
+    client = _stub_client(tmp_path, handler)
+    client.subscribe_push_notifications("token-1")
+    client.unsubscribe_push_device("token-1")
+
+    import json as _json
+
+    assert _json.loads(requests[0].content) == {
+        "PlatformType": "Android",
+        "DeviceHandle": "token-1",
+    }
+    assert _json.loads(requests[1].content) == {"DeviceHandle": "token-1"}
+    with pytest.raises(ValueError):
+        client.subscribe_push_notifications("  ")
+
+
+def test_pets_requires_a_list_of_objects(tmp_path) -> None:
+    client = _stub_client(tmp_path, lambda _: httpx.Response(200, json={"pets": []}))
+    with pytest.raises(HaloAPIError):
+        client.pets()
+
+
+def test_geo_fence_add_matches_the_captured_body(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"geoFence": {"zones": []}})
+
+    client = _stub_client(tmp_path, handler)
+    client.add_geo_fence(
+        "My Fence 1",
+        [(40.0001, -75.0001), (40.0002, -75.00015), (40.0003, -75.00005)],
+    )
+
+    import json as _json
+
+    assert _json.loads(requests[0].content) == {
+        "Name": "My Fence 1",
+        "LocationPoints": [
+            {"Latitude": 40.0001, "Longitude": -75.0001},
+            {"Latitude": 40.0002, "Longitude": -75.00015},
+            {"Latitude": 40.0003, "Longitude": -75.00005},
+        ],
+        "PublicVisibilityType": "Private",
+        "Analytics": None,
+    }
+
+
+def test_fence_boundary_needs_an_enclosing_shape(tmp_path) -> None:
+    client = _stub_client(tmp_path, lambda _: httpx.Response(200, json={}))
+    with pytest.raises(ValueError, match="three location points"):
+        client.add_geo_fence("Two points", [(40.0, -75.0), (40.1, -75.1)])
+
+
+@pytest.mark.parametrize(
+    "points",
+    [
+        [(91.0, -75.0), (40.0, -75.0), (40.1, -75.1)],
+        [(40.0, -181.0), (40.0, -75.0), (40.1, -75.1)],
+    ],
+)
+def test_fence_rejects_out_of_range_coordinates(tmp_path, points) -> None:
+    client = _stub_client(tmp_path, lambda _: httpx.Response(200, json={}))
+    with pytest.raises(ValueError):
+        client.add_geo_fence("Bad", points)
+
+
+def test_geo_fence_name_check_sends_null_id_when_creating(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    client = _stub_client(tmp_path, handler)
+    assert client.geo_fence_name_is_available("My Fence 1") is True
+    assert (
+        client.geo_fence_name_is_available(
+            "Back yard", geo_fence_id="22222222-2222-4222-8222-222222222222"
+        )
+        is True
+    )
+
+    import json as _json
+
+    assert _json.loads(requests[0].content) == {"Id": None, "Name": "My Fence 1"}
+    assert _json.loads(requests[1].content) == {
+        "Id": "22222222-2222-4222-8222-222222222222",
+        "Name": "Back yard",
+    }
+
+
+def test_delete_geo_fence_uses_delete_and_validates_the_id(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"status": "success"})
+
+    client = _stub_client(tmp_path, handler)
+    assert client.delete_geo_fence("22222222-2222-4222-8222-222222222222") == {"status": "success"}
+    assert requests[0].method == "DELETE"
+    with pytest.raises(ValueError):
+        client.delete_geo_fence("../pet/x")
+
+
+def test_update_pet_sends_every_field_as_a_full_replacement(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "pet-1"})
+
+    client = _stub_client(tmp_path, handler)
+    client.update_pet(
+        "33333333-3333-4333-8333-333333333333",
+        name="Rex",
+        color_hex="#FF6D29",
+        breed="IrishSetter",
+        birthday=datetime(2024, 11, 24, tzinfo=timezone.utc),
+        weight_kg=24.947610018960187,
+    )
+
+    import json as _json
+
+    assert _json.loads(requests[0].content) == {
+        "Name": "Rex",
+        "ColorHex": "#FF6D29",
+        "Breed": "IrishSetter",
+        "Birthday": "2024-11-24T00:00:00Z",
+        "WeightKg": 24.947610018960187,
+    }
+
+
+def test_notification_status_requires_ids_and_marks_read(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={})
+
+    client = _stub_client(tmp_path, handler)
+    client.set_notification_status(["44444444-4444-4444-8444-444444444444"])
+
+    import json as _json
+
+    assert _json.loads(requests[0].content) == {
+        "Ids": ["44444444-4444-4444-8444-444444444444"],
+        "Status": "Read",
+    }
+    with pytest.raises(ValueError):
+        client.set_notification_status([])
+
+
+def test_parcel_lookup_builds_the_captured_point_literal(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"status": 200, "body": "{}"})
+
+    client = _stub_client(tmp_path, handler)
+    client.lookup_parcels(40.00015, -75.00012)
+
+    import json as _json
+
+    assert _json.loads(requests[0].content) == {
+        "spatial_intersect": "POINT(-75.00012 40.00015)",
+        "rpp": 1,
+        "page": 1,
+        "si_srid": 4326,
+        "v": 8,
+    }
+
+
+def test_course_launch_link_returns_the_external_url(tmp_path) -> None:
+    launch = "https://cloud.scorm.com/api/cloud/registration/launch/e6ce5234"
+    client = _stub_client(tmp_path, lambda _: httpx.Response(200, json=launch))
+    assert client.training_course_link("2024-curriculum-update-v1b509", "CollarFitting") == launch
+
+
+def test_add_pet_matches_the_captured_body(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "55555555", "collarInfo": None})
+
+    client = _stub_client(tmp_path, handler)
+    created = client.add_pet(
+        name="Scout",
+        color_hex="#E8C00F",
+        breed="GoldenRetriever",
+        birthday=datetime(2026, 4, 1, tzinfo=timezone.utc),
+        weight_kg=9.071858188712795,
+    )
+
+    import json as _json
+
+    assert requests[0].url.path == "/pet/add"
+    assert _json.loads(requests[0].content) == {
+        "Name": "Scout",
+        "ColorHex": "#E8C00F",
+        "Breed": "GoldenRetriever",
+        "Birthday": "2026-04-01T00:00:00Z",
+        "WeightKg": 9.071858188712795,
+    }
+    assert created["collarInfo"] is None
+
+
+def test_pet_name_check_sends_null_id_when_creating(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    client = _stub_client(tmp_path, handler)
+    assert client.pet_name_is_available("Scout") is True
+
+    import json as _json
+
+    assert requests[0].url.path == "/pet/check-name-uniqueness"
+    assert _json.loads(requests[0].content) == {"Id": None, "Name": "Scout"}
+
+
+def test_taken_name_is_reported_as_unavailable_not_an_error(tmp_path) -> None:
+    client = _stub_client(tmp_path, lambda _: httpx.Response(409))
+    assert client.pet_name_is_available("Scout") is False
+    assert client.geo_fence_name_is_available("Back yard") is False
+
+
+def test_name_check_still_raises_on_unexpected_failures(tmp_path) -> None:
+    client = _stub_client(tmp_path, lambda _: httpx.Response(500))
+    with pytest.raises(HaloAPIError):
+        client.pet_name_is_available("Scout")
