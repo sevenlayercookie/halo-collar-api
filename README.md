@@ -10,13 +10,18 @@ Implemented, observed functionality:
 - Refresh-token login and automatic access-token refresh/rotation
 - Public application configuration
 - Account collars and connectivity
-- Pet details and optional telemetry refresh
+- Pet listing, details, creation, editing, and optional telemetry refresh
+- The aggregate map view, geofence create/rename/move/delete, and safe-zone preview
 - User profile, beacons, subscription, and in-app notifications
+- Walk history, notification history, and marking notifications read
+- Correction rules and the sound/vibration intensity catalog
+- Training course progress and course launch links
 - Halo server-clock synchronization
+- Collar locate tone and push-notification registration
 - One-shot instant corrections for the six observed correction enums
 
-SignalR/WebSocket traffic, BLE rolling codes, DGNSS forwarding, push
-registration, and unobserved mutations are intentionally not implemented.
+SignalR/WebSocket traffic, BLE rolling codes, DGNSS forwarding, walk recording,
+beacon mutations, and collar provisioning are not implemented.
 
 ## Safety and privacy
 
@@ -135,12 +140,115 @@ stores the Halo account password.
 halo status
 halo configuration
 halo collars
+halo pets
 halo pet PET_ID
 halo pet PET_ID --refresh-telemetry
+halo map 37.4219983 -122.084
+halo walks --page 1 --page-size 30
+halo notifications --page 1 --page-size 30
 ```
 
 `halo collars` prints a privacy-reduced summary rather than full Wi-Fi and
 telemetry data.
+
+`halo map` calls `/account/my/map`, which the app polls on its home screen. One
+response returns `pets` (each with its collar embedded), `geoFencesInfo`, and
+`corrections`, so prefer it over several separate calls when polling.
+
+## Locate a collar
+
+```bash
+halo find-collar COLLAR_ID
+```
+
+This plays the collar's locate tone. It is a physical action, but an
+audible-only one — unlike a correction it is not aversive, so no command number
+is reserved and Halo answers `204 No Content`.
+
+## Endpoint coverage
+
+Confirmed against captured iOS and Android app traffic:
+
+| Method | Path | Client method |
+| --- | --- | --- |
+| GET | `/configuration/` | `configuration()` |
+| GET | `/collar/my/` | `collars()` |
+| GET | `/pet/my` | `pets()` |
+| GET | `/pet/{id}/` | `pet()` |
+| GET | `/account/my/map` | `account_map()` |
+| GET | `/user-profile/` | `user_profile()` |
+| GET | `/beacon/my/` | `beacons()` |
+| GET | `/subscription/my/` | `subscription()` |
+| GET | `/walk/my` | `walks()` |
+| GET | `/notification/my/query` | `notifications()` |
+| GET | `/portal-notification/my/in-app/` | `portal_notifications()` |
+| GET | `/mapbox/request/my` | `mapbox_requests()` |
+| GET | `/system/server-date-time` | `server_time()` |
+| GET | `/pet/colors` | `pet_colors()` |
+| GET | `/pet/{id}/correction-rules` | `pet_correction_rules()` |
+| GET | `/correction-rule/configuration-v2` | `correction_rule_configuration()` |
+| GET | `/training/my-v2` | `training()` |
+| GET | `/training/user/course-launch-link/{curriculum}/{course}` | `training_course_link()` |
+| POST | `/pet/{id}/run-instant-correction/` | `send_instant_correction()` |
+| POST | `/pet/add` | `add_pet()` |
+| PUT | `/pet/{id}` | `update_pet()` |
+| PUT | `/pet/check-name-uniqueness` | `pet_name_is_available()` |
+| PUT | `/notification/status` | `set_notification_status()` |
+| POST | `/geo-fence/safe-zones` | `geo_fence_safe_zones()` |
+| PUT | `/geo-fence/check-name-uniqueness` | `geo_fence_name_is_available()` |
+| POST | `/geo-fence/add` | `add_geo_fence()` |
+| PUT | `/geo-fence/{id}` | `rename_geo_fence()` |
+| PUT | `/geo-fence/{id}/location` | `update_geo_fence_location()` |
+| DELETE | `/geo-fence/{id}` | `delete_geo_fence()` |
+| POST | `/account/generate-ecommerce-login-magic-code` | `generate_ecommerce_login_magic_code()` |
+| POST | `/report-all/api/parcels` | `lookup_parcels()` |
+| PUT | `/collar/{id}/find` | `find_collar()` |
+| PUT | `/push-notification/subscribe` | `subscribe_push_notifications()` |
+| PUT | `/push-notification/unsubscribe-device` | `unsubscribe_push_device()` |
+
+Paths are sent exactly as observed, which is why some carry a trailing slash and
+others do not. `/walk/my` pages with `page`/`pageSize` while
+`/notification/my/query` pages with `Page`/`PageSize`; that inconsistency is
+Halo's, not a typo.
+
+### Fences
+
+Fence geometry is a list of `(latitude, longitude)` corners; Halo needs at least
+three. The app previews the derived safe zone while dragging, then saves:
+
+```python
+points = [(40.0001, -75.0001), (40.0002, -75.00015), (40.0003, -75.00005)]
+
+with HaloClient() as halo:
+    halo.geo_fence_safe_zones(points)          # preview, changes nothing
+    halo.geo_fence_name_is_available("Back yard")  # False when taken
+    fence = halo.add_geo_fence("Back yard", points)
+```
+
+`add_geo_fence`, `update_geo_fence_location`, and `delete_geo_fence` change where
+the collar corrects the dog, and take effect once the collar syncs. `halo
+fence-delete` asks you to type the fence id first; Halo does not return the
+deleted boundary, so re-drawing it is manual.
+
+The optional `analytics=` argument carries the app's fence-quality telemetry
+(building proximity warnings and similar). It is accepted but not required, and
+this client sends `null` by default.
+
+### Endpoints handling sensitive data
+
+`generate_ecommerce_login_magic_code()` mints a single-use code that signs the
+account into the Halo store. It is a credential — do not log it.
+
+`lookup_parcels()` proxies a third-party property database that the fence editor
+uses to detect buildings. Responses contain real owner names and mailing
+addresses for whoever owns the land, including neighbors. Its envelope's `body`
+is a JSON-encoded *string* that must be parsed a second time.
+
+### Not implemented
+
+The apps also open SignalR websockets to `halo-prod-sockets-app.azurewebsites.net`
+(`TelemetryHub` and `NotificationHub`) for live telemetry pushes. This client is
+REST-only and does not implement them.
 
 ## Send a correction
 
@@ -203,6 +311,14 @@ store.save_session(
 with HaloClient() as halo:
     collars = halo.collars()
     pet = halo.pet("PET_ID", refresh_telemetry=True)
+
+    # One aggregate call instead of several, for polling.
+    view = halo.account_map(37.4219983, -122.084, refresh_telemetry=True)
+
+    # Both return the same paged envelope:
+    # {"pageNumber", "pageSize", "totalNumberOfPages", "totalNumberOfItems", "results"}
+    walks = halo.walks(page=1, page_size=30)
+    alerts = halo.notifications(page=1, page_size=30)
 
     # Physical action: there is intentionally no retry.
     result = halo.send_instant_correction(
