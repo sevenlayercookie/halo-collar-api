@@ -376,7 +376,7 @@ def _stub_client(tmp_path, handler) -> HaloClient:
         tokens=tokens(),
         store=StateStore(tmp_path / "state.json"),
         app_instance_id="app-instance",
-        amplitude_session_id="1785108819973",
+        amplitude_session_id="1700000000000",
         http=httpx.Client(transport=httpx.MockTransport(handler)),
     )
 
@@ -398,7 +398,7 @@ def test_account_map_sends_the_captured_viewport_parameters(tmp_path) -> None:
         "RefreshTelemetry": ["False"],
         "MaxCorrectionsCount": ["20"],
     }
-    assert requests[0].headers["Halo-Amplitude-SessionId"] == "1785108819973"
+    assert requests[0].headers["Halo-Amplitude-SessionId"] == "1700000000000"
 
 
 def test_paged_endpoints_use_halos_inconsistent_parameter_casing(tmp_path) -> None:
@@ -626,7 +626,7 @@ def test_parcel_lookup_builds_the_captured_point_literal(tmp_path) -> None:
 
 
 def test_course_launch_link_returns_the_external_url(tmp_path) -> None:
-    launch = "https://cloud.scorm.com/api/cloud/registration/launch/e6ce5234"
+    launch = "https://cloud.scorm.com/api/cloud/registration/launch/00000000-0000-4000-8000-000000000000"
     client = _stub_client(tmp_path, lambda _: httpx.Response(200, json=launch))
     assert client.training_course_link("2024-curriculum-update-v1b509", "CollarFitting") == launch
 
