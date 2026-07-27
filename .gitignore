@@ -11,6 +11,9 @@ android-har/
 .env.*
 *.token.json
 
+# macOS directory metadata.
+.DS_Store
+
 # Python build/test artifacts.
 __pycache__/
 *.py[cod]
