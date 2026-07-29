@@ -188,9 +188,19 @@ def build_parser() -> argparse.ArgumentParser:
     pet_update.add_argument("pet_id")
     _pet_profile_arguments(pet_update, required=False)
 
-    fence_add = subparsers.add_parser(
-        "fence-add",
-        help="Create a containment fence (changes where the collar corrects).",
+    pet_delete = subparsers.add_parser("pet-delete", help="Delete a pet (destructive).")
+    pet_delete.add_argument("pet_id")
+    pet_delete.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the interactive confirmation.",
+    )
+
+    fence_add = _with_full(
+        subparsers.add_parser(
+            "fence-add",
+            help="Create a containment fence (changes where the collar corrects).",
+        )
     )
     fence_add.add_argument("name")
     _fence_point_arguments(fence_add)
@@ -347,6 +357,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             elif args.command == "pet-update":
                 return _update_pet(args, client)
+            elif args.command == "pet-delete":
+                return _delete_pet(args, client)
             elif args.command == "fence-add":
                 return _add_fence(args, client)
             elif args.command == "fence-move":
@@ -568,6 +580,22 @@ def _update_pet(args: argparse.Namespace, client: HaloClient) -> int:
     return 0
 
 
+def _delete_pet(args: argparse.Namespace, client: HaloClient) -> int:
+    pet = client.pet(args.pet_id)
+    pet_name = str(pet.get("name") or args.pet_id)
+    if not args.yes:
+        print(
+            f"\nThis permanently deletes {pet_name} and the history Halo keeps under it. "
+            "Halo does not return the deleted pet, so nothing here can undo it."
+        )
+        if input(f"Type the pet name ({pet_name}) to delete it: ").strip() != pet_name:
+            print("Cancelled; the pet was not deleted.")
+            return 1
+    client.delete_pet(args.pet_id)
+    print(f"Deleted {pet_name}.")
+    return 0
+
+
 def _add_fence(args: argparse.Namespace, client: HaloClient) -> int:
     points = _points(args.point)
     if not args.yes:
@@ -579,7 +607,14 @@ def _add_fence(args: argparse.Namespace, client: HaloClient) -> int:
         if input(f"Type the fence name ({args.name}) to create it: ").strip() != args.name:
             print("Cancelled; no fence was created.")
             return 1
-    _print_json(client.add_geo_fence(args.name, points))
+    created = client.add_geo_fence(args.name, points)
+    # Halo nests the new fence under `geoFence`, and echoing it whole would
+    # print the signed thumbnail URL that every other command hides.
+    fence = created.get("geoFence") if isinstance(created, dict) else None
+    if args.full or not isinstance(fence, dict):
+        _print_json(created)
+    else:
+        _print_json(_safe_fence_summary([fence])[0])
     return 0
 
 
