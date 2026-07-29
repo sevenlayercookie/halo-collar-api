@@ -7,6 +7,7 @@ import getpass
 import json
 import sys
 import webbrowser
+from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -139,6 +140,12 @@ def build_parser() -> argparse.ArgumentParser:
     _with_full(subparsers.add_parser("pets", help="List every pet, including pets with no collar."))
 
     _with_full(subparsers.add_parser("fences", help="List the geofences on the account."))
+    _with_full(
+        subparsers.add_parser(
+            "videos",
+            help="List the onboarding, training, and subscription video streams.",
+        )
+    )
 
     pet = subparsers.add_parser("pet", help="Fetch one pet.")
     pet.add_argument("pet_id")
@@ -302,6 +309,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             elif args.command == "fences":
                 fences = client.geofences()
                 _print_json(fences if args.full else _safe_fence_summary(fences))
+            elif args.command == "videos":
+                videos = client.videos()
+                _print_json(videos if args.full else _video_index(videos))
             elif args.command == "pet":
                 _print_json(client.pet(args.pet_id, refresh_telemetry=args.refresh_telemetry))
             elif args.command == "map":
@@ -631,6 +641,24 @@ def _move_fence(args: argparse.Namespace, client: HaloClient) -> int:
             return 1
     _print_json(client.update_geo_fence_location(args.fence_id, points))
     return 0
+
+
+def _video_index(videos: list[dict[str, Any]]) -> dict[str, Any]:
+    """Flatten to name -> stream URL, qualifying only the names that repeat.
+
+    Nothing is redacted here: these URLs are unsigned and the configuration they
+    come from needs no login. `--full` adds thumbnails and the section each one
+    was found in.
+    """
+
+    counts = Counter(video.get("name") for video in videos)
+    index: dict[str, Any] = {}
+    for video in videos:
+        name = video.get("name") or ""
+        section = video.get("section")
+        key = f"{section}.{name}" if counts[name] > 1 and section else name
+        index[key] = video.get("videoStreamUrl")
+    return index
 
 
 def _safe_profile_summary(profile: dict[str, Any]) -> dict[str, Any]:
