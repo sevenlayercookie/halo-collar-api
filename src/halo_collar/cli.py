@@ -1,10 +1,19 @@
-"""User-friendly command-line interface for the Halo Collar client."""
+"""Command-line interface for the Halo Collar client.
+
+Commands are `noun verb`: `halo pet list`, `halo fence delete FENCE_ID`. Every
+noun and every verb answers `--help`, and `halo help pet add` reaches the same
+text for people who type it that way.
+
+Data goes to stdout so it can be piped. Notices, confirmations, and errors go to
+stderr so they never contaminate that pipe, which is why `halo pet delete` can
+be silent on stdout and still tell you what it did.
+"""
 
 from __future__ import annotations
 
 import argparse
+import difflib
 import getpass
-import json
 import sys
 import webbrowser
 from collections import Counter
@@ -30,7 +39,221 @@ from .errors import (
     UnsafeCorrectionError,
 )
 from .models import CorrectionType
+from .output import (
+    Column,
+    Output,
+    safe_collar_summary,
+    safe_fence_summary,
+    safe_map_summary,
+    safe_pet_summary,
+    safe_profile_summary,
+)
 from .storage import StateStore
+
+SUPPORT_URL = "https://github.com/sevenlayercookie/halo-collar-api/issues"
+
+# Exit codes. Anything unmapped is a usage error from argparse, which is 2.
+EXIT_OK = 0
+EXIT_NO_LOGIN = 1
+EXIT_ERROR = 2
+EXIT_STALE_COMMAND = 3
+EXIT_UNKNOWN_OUTCOME = 4
+EXIT_UNSAFE = 5
+EXIT_INTERRUPTED = 130
+
+# The flat command names this CLI used before it moved to `noun verb`. They are
+# gone rather than aliased, so the least the tool can do is say where they went.
+RETIRED_COMMANDS = {
+    "collars": "halo collar list",
+    "configuration": "halo system config",
+    "correct": "halo correction send",
+    "correction-config": "halo correction config",
+    "correction-rules": "halo correction rules",
+    "beacons": "halo beacon list",
+    "fences": "halo fence list",
+    "fence-add": "halo fence add",
+    "fence-delete": "halo fence delete",
+    "fence-move": "halo fence move",
+    "fence-rename": "halo fence rename",
+    "find-collar": "halo collar locate",
+    "inbox": "halo notification inbox",
+    "login": "halo auth login",
+    "logout": "halo auth logout",
+    "map": "halo account map",
+    "notifications": "halo notification list",
+    "notifications-read": "halo notification read",
+    "parcels": "halo parcel lookup",
+    "pets": "halo pet list",
+    "pet-add": "halo pet add",
+    "pet-colors": "halo pet colors",
+    "pet-delete": "halo pet delete",
+    "pet-update": "halo pet update",
+    "profile": "halo account profile",
+    "register-device": "halo device register",
+    "server-time": "halo system time",
+    "status": "halo auth status",
+    "subscription": "halo account subscription",
+    "videos": "halo system videos",
+    "walks": "halo walk list",
+}
+
+CONCISE_HELP = f"""\
+halo — unofficial client for observed Halo Collar REST endpoints
+
+USAGE
+  halo <noun> <verb> [flags]
+
+EXAMPLES
+  halo auth login --password        Log in and store the session
+  halo pet list                     Every pet, including collarless ones
+  halo collar list                  Collars, battery, and connectivity
+  halo fence list                   Geofences on the account
+  halo correction send PET_ID Warning
+                                    Send one correction, with safety checks
+
+NOUNS
+  auth          Log in, log out, inspect the stored session
+  account       Profile, subscription, and the combined map view
+  pet           List, inspect, create, edit, and delete pets
+  collar        List collars and play a collar's locate tone
+  fence         List and change containment fences
+  beacon        List beacons and their ranges
+  walk          List recorded walks
+  notification  Notification history and the in-app inbox
+  correction    Send a correction and read the rules behind it
+  training      Training course progress
+  device        Register this installation with Halo
+  parcel        Look up land records the fence editor uses
+  system        Public configuration, server clock, and video streams
+
+Output is JSON with --json, and a table otherwise. Data goes to stdout;
+notices and errors go to stderr.
+
+Run `halo help` for every command, or `halo <noun> --help`.
+Report problems at {SUPPORT_URL}
+"""
+
+
+def _version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("halo-collar")
+    except Exception:  # pragma: no cover - only when running from a bare tree
+        return "unknown"
+
+
+class _HelpfulParser(argparse.ArgumentParser):
+    """An argparse parser that suggests a command instead of only refusing one."""
+
+    def error(self, message: str) -> Any:
+        if "invalid choice" in message:
+            bad = message.split("'")[1] if "'" in message else ""
+            print(f"halo: unknown command {bad!r}.\n", file=sys.stderr)
+            for line in _suggestions(bad):
+                print(line, file=sys.stderr)
+            print(f"\nRun `{self.prog} --help` to see the available commands.", file=sys.stderr)
+            raise SystemExit(EXIT_ERROR)
+        super().error(message)
+
+
+def _suggestions(bad: str) -> list[str]:
+    """Point at the new spelling of a retired command, or the nearest command."""
+
+    retired = RETIRED_COMMANDS.get(bad)
+    if retired:
+        return [f"`{bad}` was replaced by `{retired}`.", "", "Did you mean?", f"    {retired}"]
+    close = difflib.get_close_matches(bad, sorted(RETIRED_COMMANDS), n=1, cutoff=0.7)
+    if close:
+        return [
+            "Did you mean?",
+            f"    {RETIRED_COMMANDS[close[0]]}",
+        ]
+    return []
+
+
+def _common_flags() -> argparse.ArgumentParser:
+    """Flags every command accepts, before or after the verb.
+
+    They default to SUPPRESS so that a value given at the top level survives the
+    subparser, which would otherwise overwrite it with its own default.
+    """
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Print Halo's data as JSON instead of a table.",
+    )
+    common.add_argument(
+        "--plain",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Print tab-separated rows with no alignment, for grep and awk.",
+    )
+    common.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Suppress notices on stderr. Data and errors still print.",
+    )
+    common.add_argument(
+        "--no-input",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Never prompt. Commands needing confirmation fail unless --yes is passed.",
+    )
+    common.add_argument(
+        "--state-file",
+        default=argparse.SUPPRESS,
+        help="Override the owner-only credential/counter state path.",
+    )
+    common.add_argument(
+        "--timezone",
+        default=argparse.SUPPRESS,
+        help="IANA timezone sent in Halo-Client (for example America/Chicago).",
+    )
+    return common
+
+
+def _leaf(
+    group: Any,
+    name: str,
+    *,
+    help_text: str,
+    description: str,
+    examples: str,
+    handler: Any,
+    needs_client: bool = True,
+) -> argparse.ArgumentParser:
+    """Add one verb, with the help every verb is expected to have."""
+
+    parser = group.add_parser(
+        name,
+        help=help_text,
+        description=description,
+        epilog=f"EXAMPLES\n{examples}\n\nReport problems at {SUPPORT_URL}",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        parents=[_common_flags()],
+    )
+    parser.set_defaults(handler=handler, needs_client=needs_client)
+    return parser
+
+
+def _group(subparsers: Any, name: str, *, help_text: str, description: str) -> Any:
+    """Add one noun and return its verb subparsers."""
+
+    parser = subparsers.add_parser(
+        name,
+        help=help_text,
+        description=description,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.set_defaults(handler=None, needs_client=False, group_parser=parser)
+    return parser.add_subparsers(dest="verb", metavar="<verb>")
 
 
 def _with_full(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -38,12 +261,22 @@ def _with_full(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
 
     Everything Halo returns stays reachable; the flag only keeps coordinates,
     signed URLs, and Wi-Fi details out of terminal output nobody asked for.
+    Because the whole payload has no flat shape, --full always prints JSON.
     """
 
     parser.add_argument(
         "--full",
         action="store_true",
-        help="Print Halo's complete response, including GPS coordinates and signed URLs.",
+        help="Print Halo's complete response as JSON, including GPS and signed URLs.",
+    )
+    return parser
+
+
+def _with_confirmation(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the interactive confirmation. Required when stdin is not a terminal.",
     )
     return parser
 
@@ -51,11 +284,13 @@ def _with_full(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
 def _pet_profile_arguments(parser: argparse.ArgumentParser, *, required: bool) -> None:
     """Halo replaces a pet wholesale, so both commands take the same five fields."""
 
-    parser.add_argument("--name", required=required)
-    parser.add_argument("--color-hex", required=required, help="One of `halo pet-colors`.")
-    parser.add_argument("--breed", required=required)
+    parser.add_argument("--name", required=required, help="The pet's display name.")
+    parser.add_argument(
+        "--color-hex", required=required, help="Collar color; one of `halo pet colors`."
+    )
+    parser.add_argument("--breed", required=required, help="Breed slug, e.g. goldenretriever.")
     parser.add_argument("--birthday", required=required, help="ISO date, for example 2021-04-17.")
-    parser.add_argument("--weight-kg", required=required, type=float)
+    parser.add_argument("--weight-kg", required=required, type=float, help="Weight in kilograms.")
 
 
 def _fence_point_arguments(parser: argparse.ArgumentParser) -> None:
@@ -66,11 +301,7 @@ def _fence_point_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="LAT,LON",
         help="A boundary corner; repeat at least three times, in order.",
     )
-    parser.add_argument(
-        "--yes",
-        action="store_true",
-        help="Skip the interactive confirmation.",
-    )
+    _with_confirmation(parser)
 
 
 def _points(values: Sequence[str]) -> list[tuple[float, float]]:
@@ -89,21 +320,67 @@ def _points(values: Sequence[str]) -> list[tuple[float, float]]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _HelpfulParser(
         prog="halo",
         description="Unofficial client for observed Halo Collar REST endpoints.",
+        epilog=f"Run `halo help` for a tour.\nReport problems at {SUPPORT_URL}",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        parents=[_common_flags()],
+        add_help=True,
     )
-    parser.add_argument(
-        "--state-file",
-        help="Override the owner-only credential/counter state path.",
-    )
-    parser.add_argument(
-        "--timezone",
-        help="IANA timezone sent in Halo-Client (for example America/Chicago).",
-    )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument("--version", action="version", version=f"halo {_version()}")
+    parser.set_defaults(handler=None, needs_client=False, group_parser=None)
+    subparsers = parser.add_subparsers(dest="noun", metavar="<noun>")
 
-    login = subparsers.add_parser("login", help="Log in with a password or hosted browser.")
+    _build_auth(subparsers)
+    _build_account(subparsers)
+    _build_pet(subparsers)
+    _build_collar(subparsers)
+    _build_fence(subparsers)
+    _build_beacon(subparsers)
+    _build_walk(subparsers)
+    _build_notification(subparsers)
+    _build_correction(subparsers)
+    _build_training(subparsers)
+    _build_device(subparsers)
+    _build_parcel(subparsers)
+    _build_system(subparsers)
+
+    help_parser = subparsers.add_parser(
+        "help",
+        help="Show help for any noun or verb.",
+        description="Show help for any noun or verb, the long way round.",
+        epilog="EXAMPLES\n  halo help\n  halo help pet\n  halo help pet add",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    help_parser.add_argument("topic", nargs="*", metavar="<noun> [verb]")
+    help_parser.set_defaults(handler=None, needs_client=False, group_parser=None)
+    return parser
+
+
+def _build_auth(subparsers: Any) -> None:
+    auth = _group(
+        subparsers,
+        "auth",
+        help_text="Log in, log out, inspect the stored session.",
+        description="Manage the stored Halo session. Tokens live in the state file.",
+    )
+    login = _leaf(
+        auth,
+        "login",
+        help_text="Log in with a password or the hosted browser page.",
+        description=(
+            "Log in and store the session. Without a mode flag this opens Halo's "
+            "hosted login page; your password is never seen by this tool."
+        ),
+        examples=(
+            "  halo auth login --password\n"
+            "  halo auth login --platform ios\n"
+            "  halo auth login --from-refresh-token"
+        ),
+        handler=_auth_login,
+        needs_client=False,
+    )
     mode = login.add_mutually_exclusive_group()
     mode.add_argument(
         "--password",
@@ -132,304 +409,553 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the login URL without attempting to open a browser.",
     )
 
-    subparsers.add_parser("logout", help="Delete locally stored tokens and command counters.")
-    subparsers.add_parser("status", help="Show local login status without revealing tokens.")
-    subparsers.add_parser("configuration", help="Fetch public Halo configuration.")
-    _with_full(subparsers.add_parser("collars", help="List collars on the account."))
+    _leaf(
+        auth,
+        "logout",
+        help_text="Delete stored tokens and command counters.",
+        description="Delete the local session. Halo is not told; the refresh token simply goes.",
+        examples="  halo auth logout",
+        handler=_auth_logout,
+        needs_client=False,
+    )
+    _leaf(
+        auth,
+        "status",
+        help_text="Show login status without revealing tokens.",
+        description="Report whether a usable session is stored, and where it lives.",
+        examples="  halo auth status\n  halo auth status --json",
+        handler=_auth_status,
+        needs_client=False,
+    )
 
-    _with_full(subparsers.add_parser("pets", help="List every pet, including pets with no collar."))
 
-    _with_full(subparsers.add_parser("fences", help="List the geofences on the account."))
+def _build_account(subparsers: Any) -> None:
+    account = _group(
+        subparsers,
+        "account",
+        help_text="Profile, subscription, and the combined map view.",
+        description="Read account-level data.",
+    )
     _with_full(
-        subparsers.add_parser(
-            "videos",
-            help="List the onboarding, training, and subscription video streams.",
+        _leaf(
+            account,
+            "profile",
+            help_text="Show the account profile.",
+            description=(
+                "Show the account profile. Summarized by default because the payload "
+                "carries your email addresses, avatar URL, and referral link."
+            ),
+            examples="  halo account profile\n  halo account profile --full",
+            handler=_account_profile,
         )
     )
-
-    pet = subparsers.add_parser("pet", help="Fetch one pet.")
-    pet.add_argument("pet_id")
-    pet.add_argument("--refresh-telemetry", action="store_true")
-
+    _leaf(
+        account,
+        "subscription",
+        help_text="Show plan, limits, and enabled features.",
+        description="Show the subscription: access level, collar and fence limits, features.",
+        examples="  halo account subscription\n  halo account subscription --json",
+        handler=_account_subscription,
+    )
     account_map = _with_full(
-        subparsers.add_parser(
+        _leaf(
+            account,
             "map",
-            help="Fetch pets, fences, and recent corrections in one call.",
+            help_text="Fetch pets, fences, and corrections in one call.",
+            description=(
+                "Fetch the aggregate view the app polls on its home screen: pets with "
+                "collars embedded, geofences, and recent corrections. Prefer this over "
+                "several calls when polling. The viewport coordinates are optional."
+            ),
+            examples=(
+                "  halo account map\n"
+                "  halo account map --latitude 37.4219983 --longitude -122.084\n"
+                "  halo account map --full"
+            ),
+            handler=_account_map,
         )
     )
-    account_map.add_argument("latitude", type=float, nargs="?")
-    account_map.add_argument("longitude", type=float, nargs="?")
-    account_map.add_argument("--refresh-telemetry", action="store_true")
-    account_map.add_argument("--max-corrections", type=int, default=20)
-
-    _with_full(subparsers.add_parser("profile", help="Show the account profile."))
-    subparsers.add_parser("beacons", help="List beacons and their available ranges.")
-    subparsers.add_parser("subscription", help="Show plan, limits, and enabled features.")
-    subparsers.add_parser("inbox", help="List in-app portal notifications.")
-    subparsers.add_parser(
-        "correction-config",
-        help="Show Halo's global sound, vibration, and intensity catalog.",
-    )
-    subparsers.add_parser("server-time", help="Show Halo's UTC server clock.")
-    subparsers.add_parser(
-        "register-device",
-        help="Register this installation and store the MobileId corrections carry.",
-    )
-
-    parcels = subparsers.add_parser(
-        "parcels",
-        help="Look up land-parcel records at a point (returns third-party names).",
-    )
-    parcels.add_argument("latitude", type=float)
-    parcels.add_argument("longitude", type=float)
-    parcels.add_argument("--page", type=int, default=1)
-    parcels.add_argument("--results-per-page", type=int, default=1)
-
-    pet_add = subparsers.add_parser("pet-add", help="Create a pet.")
-    _pet_profile_arguments(pet_add, required=True)
-
-    pet_update = subparsers.add_parser(
-        "pet-update",
-        help="Update a pet; unspecified fields keep their current values.",
-    )
-    pet_update.add_argument("pet_id")
-    _pet_profile_arguments(pet_update, required=False)
-
-    pet_delete = subparsers.add_parser("pet-delete", help="Delete a pet (destructive).")
-    pet_delete.add_argument("pet_id")
-    pet_delete.add_argument(
-        "--yes",
+    account_map.add_argument("--latitude", type=float, help="Viewport centre latitude.")
+    account_map.add_argument("--longitude", type=float, help="Viewport centre longitude.")
+    account_map.add_argument(
+        "--refresh-telemetry",
         action="store_true",
-        help="Skip the interactive confirmation.",
+        help="Ask the collars for fresher telemetry before answering.",
+    )
+    account_map.add_argument(
+        "--max-corrections",
+        type=int,
+        default=20,
+        help="How many recent corrections to include (default: 20).",
     )
 
-    fence_add = _with_full(
-        subparsers.add_parser(
-            "fence-add",
-            help="Create a containment fence (changes where the collar corrects).",
+
+def _build_pet(subparsers: Any) -> None:
+    pet = _group(
+        subparsers,
+        "pet",
+        help_text="List, inspect, create, edit, and delete pets.",
+        description="Work with the pets on the account, with or without collars.",
+    )
+    _with_full(
+        _leaf(
+            pet,
+            "list",
+            help_text="List every pet, including pets with no collar.",
+            description=(
+                "List every pet on the account. Pets that have never had a collar "
+                "assigned appear here but never in `halo collar list`."
+            ),
+            examples="  halo pet list\n  halo pet list --json\n  halo pet list --plain",
+            handler=_pet_list,
         )
     )
-    fence_add.add_argument("name")
-    _fence_point_arguments(fence_add)
-
-    fence_move = subparsers.add_parser(
-        "fence-move",
-        help="Replace a fence's boundary (changes where the collar corrects).",
+    show = _leaf(
+        pet,
+        "show",
+        help_text="Fetch one pet in full.",
+        description=(
+            "Fetch one pet. This prints the complete object, including live "
+            "coordinates, so it is JSON whatever the format flags say."
+        ),
+        examples="  halo pet show PET_ID\n  halo pet show PET_ID --refresh-telemetry",
+        handler=_pet_show,
     )
-    fence_move.add_argument("fence_id")
-    _fence_point_arguments(fence_move)
-
-    walks = subparsers.add_parser("walks", help="List recorded walks.")
-    walks.add_argument("--page", type=int, default=1)
-    walks.add_argument("--page-size", type=int, default=30)
-
-    notifications = subparsers.add_parser("notifications", help="List notification history.")
-    notifications.add_argument("--page", type=int, default=1)
-    notifications.add_argument("--page-size", type=int, default=30)
-
-    subparsers.add_parser("training", help="Show training course progress.")
-    subparsers.add_parser("pet-colors", help="List assignable collar colors.")
-
-    rules = subparsers.add_parser("correction-rules", help="Show a pet's correction rules.")
-    rules.add_argument("pet_id")
-
-    mark_read = subparsers.add_parser("notifications-read", help="Mark notifications read.")
-    mark_read.add_argument("notification_id", nargs="+")
-
-    rename_fence = subparsers.add_parser("fence-rename", help="Rename a fence.")
-    rename_fence.add_argument("fence_id")
-    rename_fence.add_argument("name")
-
-    delete_fence = subparsers.add_parser(
-        "fence-delete",
-        help="Delete a containment fence (destructive).",
-    )
-    delete_fence.add_argument("fence_id")
-    delete_fence.add_argument(
-        "--yes",
+    show.add_argument("pet_id", help="The pet's UUID, from `halo pet list`.")
+    show.add_argument(
+        "--refresh-telemetry",
         action="store_true",
-        help="Skip the interactive confirmation.",
+        help="Ask the collar for fresher telemetry before answering.",
     )
 
-    find = subparsers.add_parser(
-        "find-collar",
-        help="Play the collar's locate tone (audible only, not a correction).",
+    add = _leaf(
+        pet,
+        "add",
+        help_text="Create a pet.",
+        description="Create a pet. The new pet has no collar until one is bound to it.",
+        examples=(
+            "  halo pet add --name Scout --color-hex '#FF7A00' \\\n"
+            "      --breed goldenretriever --birthday 2021-04-17 --weight-kg 28.5"
+        ),
+        handler=_pet_add,
     )
-    find.add_argument("collar_id")
+    _pet_profile_arguments(add, required=True)
 
-    correction = subparsers.add_parser(
-        "correct",
-        help="Send one instant correction with safety checks.",
+    update = _leaf(
+        pet,
+        "update",
+        help_text="Update a pet; unspecified fields keep their values.",
+        description=(
+            "Update a pet. Halo replaces the whole profile rather than patching it, "
+            "so this reads the pet first and sends back whatever you did not pass."
+        ),
+        examples="  halo pet update PET_ID --weight-kg 29.2\n  halo pet update PET_ID --name Scout",
+        handler=_pet_update,
     )
-    correction.add_argument("pet_id")
-    correction.add_argument(
+    update.add_argument("pet_id", help="The pet's UUID, from `halo pet list`.")
+    _pet_profile_arguments(update, required=False)
+
+    delete = _with_confirmation(
+        _leaf(
+            pet,
+            "delete",
+            help_text="Delete a pet and its history (destructive).",
+            description=(
+                "Delete a pet and everything Halo keeps under it. Halo returns nothing, "
+                "so this cannot be undone from here. You are asked to type the pet's name."
+            ),
+            examples="  halo pet delete PET_ID\n  halo pet delete PET_ID --yes",
+            handler=_pet_delete,
+        )
+    )
+    delete.add_argument("pet_id", help="The pet's UUID, from `halo pet list`.")
+
+    _leaf(
+        pet,
+        "colors",
+        help_text="List assignable collar colors.",
+        description="List the collar colors Halo accepts as --color-hex.",
+        examples="  halo pet colors\n  halo pet colors --plain",
+        handler=_pet_colors,
+    )
+
+
+def _build_collar(subparsers: Any) -> None:
+    collar = _group(
+        subparsers,
+        "collar",
+        help_text="List collars and play a collar's locate tone.",
+        description="Work with the collars bound to pets on the account.",
+    )
+    _with_full(
+        _leaf(
+            collar,
+            "list",
+            help_text="List collars, battery, and connectivity.",
+            description=(
+                "List collars. Summarized by default; the full payload carries Wi-Fi "
+                "SSIDs, hardware UUIDs, and telemetry."
+            ),
+            examples="  halo collar list\n  halo collar list --full",
+            handler=_collar_list,
+        )
+    )
+    locate = _leaf(
+        collar,
+        "locate",
+        help_text="Play the collar's locate tone.",
+        description=(
+            "Play the collar's locate tone. This is audible only — it is not a "
+            "correction and carries no feedback."
+        ),
+        examples="  halo collar locate COLLAR_ID",
+        handler=_collar_locate,
+    )
+    locate.add_argument("collar_id", help="The collar's UUID, from `halo collar list`.")
+
+
+def _build_fence(subparsers: Any) -> None:
+    fence = _group(
+        subparsers,
+        "fence",
+        help_text="List and change containment fences.",
+        description=(
+            "Work with geofences. Adding, moving, or deleting one changes where the "
+            "collar corrects the dog, once the collar syncs."
+        ),
+    )
+    _with_full(
+        _leaf(
+            fence,
+            "list",
+            help_text="List the geofences on the account.",
+            description=(
+                "List geofences. Halo has no fence-list endpoint, so this reads them "
+                "out of the map payload. Summarized by default: the full response "
+                "carries the zone polygons, the address, and a signed thumbnail URL."
+            ),
+            examples="  halo fence list\n  halo fence list --full",
+            handler=_fence_list,
+        )
+    )
+    add = _with_full(
+        _leaf(
+            fence,
+            "add",
+            help_text="Create a containment fence.",
+            description=(
+                "Create a containment fence from at least three boundary corners, in "
+                "order. You are asked to type the fence name before it is created."
+            ),
+            examples=(
+                "  halo fence add 'Back yard' --point 40.0001,-75.0001 \\\n"
+                "      --point 40.0002,-75.00015 --point 40.0003,-75.00005"
+            ),
+            handler=_fence_add,
+        )
+    )
+    add.add_argument("name", help="A name for the fence.")
+    _fence_point_arguments(add)
+
+    rename = _leaf(
+        fence,
+        "rename",
+        help_text="Rename a fence.",
+        description="Rename a fence. The boundary is untouched.",
+        examples="  halo fence rename FENCE_ID 'Front yard'",
+        handler=_fence_rename,
+    )
+    rename.add_argument("fence_id", help="The fence's UUID, from `halo fence list`.")
+    rename.add_argument("name", help="The new name.")
+
+    move = _leaf(
+        fence,
+        "move",
+        help_text="Replace a fence's boundary (destructive).",
+        description=(
+            "Replace a fence's boundary outright. The old boundary is not returned, "
+            "and a dog relying on this fence follows the new one once the collar syncs."
+        ),
+        examples=(
+            "  halo fence move FENCE_ID --point 40.0001,-75.0001 \\\n"
+            "      --point 40.0002,-75.00015 --point 40.0004,-75.00005"
+        ),
+        handler=_fence_move,
+    )
+    move.add_argument("fence_id", help="The fence's UUID, from `halo fence list`.")
+    _fence_point_arguments(move)
+
+    delete = _with_confirmation(
+        _leaf(
+            fence,
+            "delete",
+            help_text="Delete a fence (destructive).",
+            description=(
+                "Delete a containment fence. Halo does not return the deleted boundary, "
+                "so re-drawing it is manual, and any dog relying on it loses it."
+            ),
+            examples="  halo fence delete FENCE_ID\n  halo fence delete FENCE_ID --yes",
+            handler=_fence_delete,
+        )
+    )
+    delete.add_argument("fence_id", help="The fence's UUID, from `halo fence list`.")
+
+
+def _build_beacon(subparsers: Any) -> None:
+    beacon = _group(
+        subparsers,
+        "beacon",
+        help_text="List beacons and their ranges.",
+        description="Read the beacons registered to the account.",
+    )
+    _leaf(
+        beacon,
+        "list",
+        help_text="List beacons and the available ranges.",
+        description="List beacons on the account, with the range levels Halo offers.",
+        examples="  halo beacon list\n  halo beacon list --json",
+        handler=_beacon_list,
+    )
+
+
+def _build_walk(subparsers: Any) -> None:
+    walk = _group(
+        subparsers,
+        "walk",
+        help_text="List recorded walks.",
+        description="Read the walk history Halo records.",
+    )
+    listing = _leaf(
+        walk,
+        "list",
+        help_text="List recorded walks, one page at a time.",
+        description="List recorded walks. Halo pages these; ask for a page at a time.",
+        examples="  halo walk list\n  halo walk list --page 2 --page-size 10",
+        handler=_walk_list,
+    )
+    listing.add_argument("--page", type=int, default=1, help="Page number (default: 1).")
+    listing.add_argument("--page-size", type=int, default=30, help="Rows per page (default: 30).")
+
+
+def _build_notification(subparsers: Any) -> None:
+    notification = _group(
+        subparsers,
+        "notification",
+        help_text="Notification history and the in-app inbox.",
+        description=(
+            "Halo keeps two separate feeds: the notification history behind `list`, "
+            "and the in-app portal messages behind `inbox`."
+        ),
+    )
+    listing = _leaf(
+        notification,
+        "list",
+        help_text="List notification history.",
+        description="List the notification history, one page at a time.",
+        examples="  halo notification list\n  halo notification list --page 2",
+        handler=_notification_list,
+    )
+    listing.add_argument("--page", type=int, default=1, help="Page number (default: 1).")
+    listing.add_argument("--page-size", type=int, default=30, help="Rows per page (default: 30).")
+
+    read = _leaf(
+        notification,
+        "read",
+        help_text="Mark notifications read.",
+        description="Mark one or more notifications read.",
+        examples="  halo notification read NOTIFICATION_ID\n  halo notification read ID_1 ID_2",
+        handler=_notification_read,
+    )
+    read.add_argument("notification_id", nargs="+", help="One or more notification UUIDs.")
+
+    _leaf(
+        notification,
+        "inbox",
+        help_text="List in-app portal notifications.",
+        description="List the in-app portal messages, a different feed from `list`.",
+        examples="  halo notification inbox",
+        handler=_notification_inbox,
+    )
+
+
+def _build_correction(subparsers: Any) -> None:
+    correction = _group(
+        subparsers,
+        "correction",
+        help_text="Send a correction and read the rules behind it.",
+        description=(
+            "A correction is a physical action. Cloud acceptance does not prove the "
+            "collar executed it, and this client never retries one."
+        ),
+    )
+    send = _with_confirmation(
+        _leaf(
+            correction,
+            "send",
+            help_text="Send one instant correction, with safety checks.",
+            description=(
+                "Send exactly one instant correction. The collar must report as "
+                "socket-connected unless you skip the check, the command number is "
+                "reserved before dispatch, and you are asked to type the pet's name.\n\n"
+                "Remove the collar from the dog and configure the lowest safe feedback "
+                "level in the official app before testing."
+            ),
+            examples=(
+                "  halo correction send PET_ID GoodBehavior --command-number 13\n"
+                "  halo correction send PET_ID ReturnWhistle\n"
+                "  halo correction send PET_ID Warning --yes"
+            ),
+            handler=_correction_send,
+        )
+    )
+    send.add_argument("pet_id", help="The pet's UUID, from `halo pet list`.")
+    send.add_argument(
         "correction_type",
         choices=[item.value for item in CorrectionType],
+        help="Which observed correction enum to send.",
     )
-    correction.add_argument(
+    send.add_argument(
         "--command-number",
         type=int,
         help="Required on first use: the next known Halo command number.",
     )
-    correction.add_argument(
-        "--yes",
-        action="store_true",
-        help="Skip the interactive physical-action confirmation.",
-    )
-    correction.add_argument(
+    send.add_argument(
         "--skip-online-check",
         action="store_true",
         help="Send even when Halo does not report a socket-connected collar.",
     )
-    return parser
+
+    rules = _leaf(
+        correction,
+        "rules",
+        help_text="Show a pet's correction rules.",
+        description="Show the correction rules Halo has configured for one pet.",
+        examples="  halo correction rules PET_ID",
+        handler=_correction_rules,
+    )
+    rules.add_argument("pet_id", help="The pet's UUID, from `halo pet list`.")
+
+    _leaf(
+        correction,
+        "config",
+        help_text="Show the global sound and intensity catalog.",
+        description="Show Halo's global catalog of sounds, vibrations, and intensity levels.",
+        examples="  halo correction config",
+        handler=_correction_config,
+    )
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    store = StateStore(args.state_file)
-    try:
-        if args.command == "login":
-            return _login(args, store)
-        if args.command == "logout":
-            removed = store.clear()
-            print("Local Halo state deleted." if removed else "No local Halo state was present.")
-            return 0
-        if args.command == "status":
-            return _status(store)
-
-        with HaloClient(store=store, timezone_name=args.timezone) as client:
-            if args.command == "configuration":
-                _print_json(client.configuration())
-            elif args.command == "collars":
-                collars = client.collars()
-                _print_json(collars if args.full else _safe_collar_summary(collars))
-            elif args.command == "pets":
-                pets = client.pets()
-                _print_json(pets if args.full else _safe_pet_summary(pets))
-            elif args.command == "fences":
-                fences = client.geofences()
-                _print_json(fences if args.full else _safe_fence_summary(fences))
-            elif args.command == "videos":
-                videos = client.videos()
-                _print_json(videos if args.full else _video_index(videos))
-            elif args.command == "pet":
-                _print_json(client.pet(args.pet_id, refresh_telemetry=args.refresh_telemetry))
-            elif args.command == "map":
-                account_map = client.account_map(
-                    args.latitude,
-                    args.longitude,
-                    refresh_telemetry=args.refresh_telemetry,
-                    max_corrections_count=args.max_corrections,
-                )
-                _print_json(account_map if args.full else _safe_map_summary(account_map))
-            elif args.command == "profile":
-                profile = client.user_profile()
-                _print_json(profile if args.full else _safe_profile_summary(profile))
-            elif args.command == "beacons":
-                _print_json(client.beacons())
-            elif args.command == "subscription":
-                _print_json(client.subscription())
-            elif args.command == "inbox":
-                _print_json(client.portal_notifications())
-            elif args.command == "correction-config":
-                _print_json(client.correction_rule_configuration())
-            elif args.command == "server-time":
-                print(client.server_time().isoformat())
-            elif args.command == "register-device":
-                mobile_id = client.register_mobile_device()
-                print(
-                    f"Registered this installation as MobileId {mobile_id}. "
-                    "Corrections now send it instead of the fallback constant."
-                )
-            elif args.command == "parcels":
-                print(
-                    "This returns public land records: real owner names and mailing "
-                    "addresses for whoever owns the land, including neighbors.",
-                    file=sys.stderr,
-                )
-                _print_json(
-                    client.lookup_parcels(
-                        args.latitude,
-                        args.longitude,
-                        page=args.page,
-                        results_per_page=args.results_per_page,
-                    )
-                )
-            elif args.command == "pet-add":
-                _print_json(
-                    client.add_pet(
-                        name=args.name,
-                        color_hex=args.color_hex,
-                        breed=args.breed,
-                        birthday=args.birthday,
-                        weight_kg=args.weight_kg,
-                    )
-                )
-            elif args.command == "pet-update":
-                return _update_pet(args, client)
-            elif args.command == "pet-delete":
-                return _delete_pet(args, client)
-            elif args.command == "fence-add":
-                return _add_fence(args, client)
-            elif args.command == "fence-move":
-                return _move_fence(args, client)
-            elif args.command == "walks":
-                _print_json(client.walks(page=args.page, page_size=args.page_size))
-            elif args.command == "notifications":
-                _print_json(client.notifications(page=args.page, page_size=args.page_size))
-            elif args.command == "training":
-                _print_json(client.training())
-            elif args.command == "pet-colors":
-                _print_json(client.pet_colors())
-            elif args.command == "correction-rules":
-                _print_json(client.pet_correction_rules(args.pet_id))
-            elif args.command == "notifications-read":
-                client.set_notification_status(args.notification_id)
-                print(f"Marked {len(args.notification_id)} notification(s) read.")
-            elif args.command == "fence-rename":
-                client.rename_geo_fence(args.fence_id, args.name)
-                print(f"Fence renamed to {args.name}.")
-            elif args.command == "fence-delete":
-                return _delete_fence(args, client)
-            elif args.command == "find-collar":
-                client.find_collar(args.collar_id)
-                print("Halo accepted the locate request. The collar plays its tone if reachable.")
-            elif args.command == "correct":
-                return _correct(args, client)
-        return 0
-    except StaleCommandNumberError as exc:
-        print(f"Correction not sent: {exc}", file=sys.stderr)
-        return 3
-    except CorrectionOutcomeUnknownError as exc:
-        print(f"WARNING: {exc}", file=sys.stderr)
-        return 4
-    except UnsafeCorrectionError as exc:
-        print(f"Safety check stopped the correction: {exc}", file=sys.stderr)
-        return 5
-    except (HaloError, ValueError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 2
-    except KeyboardInterrupt:
-        print("\nCancelled.", file=sys.stderr)
-        return 130
-    except EOFError:
-        # A confirmation prompt that cannot be answered must never be treated as
-        # consent, so closed stdin cancels rather than proceeding.
-        print("Cancelled: confirmation could not be read from input.", file=sys.stderr)
-        return 130
+def _build_training(subparsers: Any) -> None:
+    training = _group(
+        subparsers,
+        "training",
+        help_text="Training course progress.",
+        description="Read the training courses and their progress.",
+    )
+    _leaf(
+        training,
+        "show",
+        help_text="Show training course progress.",
+        description="Show the training curriculum and how far through it the account is.",
+        examples="  halo training show",
+        handler=_training_show,
+    )
 
 
-def _client_secret(profile: OAuthClientProfile) -> str:
-    secret = resolve_client_secret(profile)
-    if not secret:
-        raise ValueError(
-            f"No {profile.name} client secret is available. Set "
-            f"HALO_{profile.name.upper()}_CLIENT_SECRET."
+def _build_device(subparsers: Any) -> None:
+    device = _group(
+        subparsers,
+        "device",
+        help_text="Register this installation with Halo.",
+        description="Manage how Halo identifies this installation.",
+    )
+    _leaf(
+        device,
+        "register",
+        help_text="Register this installation and store its MobileId.",
+        description=(
+            "Register this installation and store the MobileId Halo assigns. Every "
+            "correction carries that id; until you register, corrections fall back to "
+            "a constant that is almost certainly not yours."
+        ),
+        examples="  halo device register",
+        handler=_device_register,
+    )
+
+
+def _build_parcel(subparsers: Any) -> None:
+    parcel = _group(
+        subparsers,
+        "parcel",
+        help_text="Look up land records the fence editor uses.",
+        description=(
+            "Halo proxies a third-party property database here. Responses contain real "
+            "owner names and mailing addresses, including neighbors'."
+        ),
+    )
+    lookup = _leaf(
+        parcel,
+        "lookup",
+        help_text="Look up land-parcel records at a point.",
+        description=(
+            "Look up public land records at a point, as the fence editor does. The "
+            "response is about whoever owns the land, not about you."
+        ),
+        examples="  halo parcel lookup --latitude 37.4219983 --longitude -122.084",
+        handler=_parcel_lookup,
+    )
+    lookup.add_argument("--latitude", type=float, required=True, help="Latitude of the point.")
+    lookup.add_argument("--longitude", type=float, required=True, help="Longitude of the point.")
+    lookup.add_argument("--page", type=int, default=1, help="Page number (default: 1).")
+    lookup.add_argument(
+        "--results-per-page", type=int, default=1, help="Records per page (default: 1)."
+    )
+
+
+def _build_system(subparsers: Any) -> None:
+    system = _group(
+        subparsers,
+        "system",
+        help_text="Public configuration, server clock, and video streams.",
+        description="Read what Halo publishes about itself rather than about your account.",
+    )
+    _leaf(
+        system,
+        "config",
+        help_text="Fetch the public application configuration.",
+        description="Fetch Halo's public application configuration. Needs no login.",
+        examples="  halo system config",
+        handler=_system_config,
+    )
+    _leaf(
+        system,
+        "time",
+        help_text="Show Halo's UTC server clock.",
+        description="Show Halo's server clock, which corrections use for expiry.",
+        examples="  halo system time",
+        handler=_system_time,
+    )
+    _with_full(
+        _leaf(
+            system,
+            "videos",
+            help_text="List the app's video streams.",
+            description=(
+                "List the onboarding, training, and subscription videos as name and HLS "
+                "URL. The streams are unsigned and the configuration needs no login, so "
+                "this works logged out."
+            ),
+            examples="  halo system videos\n  halo system videos --full",
+            handler=_system_videos,
         )
-    return secret
+    )
 
 
-def _login(args: argparse.Namespace, store: StateStore) -> int:
+# --- Handlers -------------------------------------------------------------
+
+
+def _auth_login(args: argparse.Namespace, _: HaloClient | None, out: Output) -> int:
+    store = _store(args)
     if args.no_browser and (args.password_grant or args.from_refresh_token):
         raise ValueError("--no-browser applies only to the hosted browser login.")
     if args.password_grant and args.platform not in (None, "android"):
@@ -447,6 +973,7 @@ def _login(args: argparse.Namespace, store: StateStore) -> int:
     secret = _client_secret(profile)
     with HaloOAuth(secret, profile=profile) as oauth:
         if args.password_grant:
+            _require_input(args, "Logging in with a password needs an interactive terminal.")
             username = input("Halo account email: ").strip()
             password = getpass.getpass("Halo account password (input hidden; never stored): ")
             try:
@@ -454,17 +981,19 @@ def _login(args: argparse.Namespace, store: StateStore) -> int:
             finally:
                 password = ""
         elif args.from_refresh_token:
+            _require_input(args, "Importing a refresh token needs an interactive terminal.")
             refresh_token = getpass.getpass("Halo refresh token (input hidden): ").strip()
             tokens = oauth.refresh(refresh_token)
         else:
+            _require_input(args, "The hosted browser login needs an interactive terminal.")
             flow = oauth.begin_login()
-            print(
+            out.note(
                 "\nSign in only on auth.halocollar.com. This tool never receives your password.\n"
             )
             opened = False if args.no_browser else webbrowser.open(flow.url)
             if not opened:
-                print(f"Open this URL in a browser:\n\n{flow.url}\n")
-            print(
+                out.note(f"Open this URL in a browser:\n\n{flow.url}\n")
+            out.note(
                 "After sign-in, copy the full URL beginning with haloapp://callback.\n"
                 "If the official app opens, copy the callback URL from the browser/proxy history."
             )
@@ -479,91 +1008,123 @@ def _login(args: argparse.Namespace, store: StateStore) -> int:
                 except OSError as exc:
                     raise ValueError(f"Cannot read browser capture at {capture_path}.") from exc
                 tokens = oauth.complete_login_from_browser_capture(capture, flow)
-                print(
+                out.note(
                     "Browser capture accepted. It still contains private session data; "
                     "protect or delete it when no longer needed."
                 )
             else:
                 callback = getpass.getpass("Callback URL (input hidden): ")
                 tokens = oauth.complete_login(callback, flow)
-    store.save_session(
-        tokens,
-        client_id=profile.client_id,
-        app_version=profile.app_version,
-    )
-    if args.timezone:
+    store.save_session(tokens, client_id=profile.client_id, app_version=profile.app_version)
+    if _flag(args, "timezone", None):
         store.update_settings(timezone=args.timezone)
     expires = datetime.fromtimestamp(tokens.expires_at, timezone.utc).isoformat()
-    print(
+    out.note(
         f"Login successful with the Halo {profile.name} profile. "
         f"Access token expires at {expires}; refresh is automatic."
     )
-    return 0
+    out.note("Next: `halo device register`, then `halo pet list`.")
+    return EXIT_OK
 
 
-def _status(store: StateStore) -> int:
+def _auth_logout(args: argparse.Namespace, _: HaloClient | None, out: Output) -> int:
+    removed = _store(args).clear()
+    out.note("Local Halo state deleted." if removed else "No local Halo state was present.")
+    return EXIT_OK
+
+
+def _auth_status(args: argparse.Namespace, _: HaloClient | None, out: Output) -> int:
+    store = _store(args)
     try:
         tokens = store.load_tokens()
     except HaloError as exc:
-        print(str(exc))
-        return 1
-    expiry = datetime.fromtimestamp(tokens.expires_at, timezone.utc).isoformat()
-    state = "expired (will refresh on next request)" if tokens.is_expired else "usable"
+        out.note(str(exc))
+        out.note("Run `halo auth login` to sign in.")
+        return EXIT_NO_LOGIN
     profile = store.auth_profile()
-    client_id = profile.get("client_id", "unknown")
-    print(
-        f"Stored login: {state}\nOAuth client: {client_id}\n"
-        f"Access-token expiry: {expiry}\nState file: {store.path}"
+    status = {
+        "state": "expired (will refresh on next request)" if tokens.is_expired else "usable",
+        "oauthClient": profile.get("client_id", "unknown"),
+        "accessTokenExpiry": datetime.fromtimestamp(tokens.expires_at, timezone.utc).isoformat(),
+        "mobileId": store.settings().get("mobile_id") or "unregistered",
+        "stateFile": str(store.path),
+    }
+    out.emit(status, pairs=status)
+    return EXIT_OK
+
+
+def _account_profile(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    profile = client.user_profile()
+    if args.full:
+        out.emit(profile)
+        return EXIT_OK
+    summary = safe_profile_summary(profile)
+    out.emit(summary, pairs=summary)
+    return EXIT_OK
+
+
+def _account_subscription(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    out.emit(client.subscription())
+    return EXIT_OK
+
+
+def _account_map(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    account_map = client.account_map(
+        args.latitude,
+        args.longitude,
+        refresh_telemetry=args.refresh_telemetry,
+        max_corrections_count=args.max_corrections,
     )
-    return 0
+    out.emit(account_map if args.full else safe_map_summary(account_map))
+    return EXIT_OK
 
 
-def _correct(args: argparse.Namespace, client: HaloClient) -> int:
-    pet = client.pet(args.pet_id)
-    pet_name = str(pet.get("name") or args.pet_id)
-    kind = CorrectionType.parse(args.correction_type)
-    if not args.yes:
-        print(
-            f"\nThis will send {kind.value} to {pet_name}. Halo accepted this enum in the "
-            "captured API, but its physical effect depends on the collar configuration.\n"
-            "For first tests, remove the collar from the dog and use the lowest safe "
-            "feedback level."
-        )
-        answer = input(f"Type the pet name ({pet_name}) to send exactly once: ").strip()
-        if answer != pet_name:
-            print("Cancelled; no correction was sent.")
-            return 1
-    result = client.send_instant_correction(
-        args.pet_id,
-        kind,
-        command_number=args.command_number,
-        require_online=not args.skip_online_check,
+PET_COLUMNS = [
+    Column("NAME", "name"),
+    Column("BREED", "breed"),
+    Column("COLLAR", "collar"),
+    Column("FENCES", "fencesState"),
+    Column("BEACONS", "beaconsState"),
+    Column("ID", "id"),
+]
+
+
+def _pet_list(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    pets = client.pets()
+    if args.full:
+        out.emit(pets)
+        return EXIT_OK
+    summary = safe_pet_summary(pets)
+    rows = [
+        {
+            **pet,
+            "collar": (pet.get("collar") or {}).get("serialNumber") if pet.get("collar") else None,
+        }
+        for pet in summary
+    ]
+    out.emit(summary, rows=rows, columns=PET_COLUMNS)
+    return EXIT_OK
+
+
+def _pet_show(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    out.emit(client.pet(args.pet_id, refresh_telemetry=args.refresh_telemetry))
+    return EXIT_OK
+
+
+def _pet_add(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    created = client.add_pet(
+        name=args.name,
+        color_hex=args.color_hex,
+        breed=args.breed,
+        birthday=args.birthday,
+        weight_kg=args.weight_kg,
     )
-    print(
-        f"Halo accepted {kind.value} for {pet_name}. "
-        "Cloud acceptance does not confirm physical execution."
-    )
-    if result.get("currentCommandNumber") is not None:
-        print(f"Halo current command number: {result['currentCommandNumber']}")
-    return 0
+    out.note(f"Created {args.name}. It has no collar until one is bound to it.")
+    out.emit(created)
+    return EXIT_OK
 
 
-def _delete_fence(args: argparse.Namespace, client: HaloClient) -> int:
-    if not args.yes:
-        print(
-            f"\nThis permanently deletes fence {args.fence_id}. Halo does not return the "
-            "deleted boundary, so re-drawing it is manual, and any dog relying on it for "
-            "containment loses that boundary once the collar syncs."
-        )
-        if input("Type the fence id to delete it: ").strip() != args.fence_id:
-            print("Cancelled; the fence was not deleted.")
-            return 1
-    client.delete_geo_fence(args.fence_id)
-    print("Fence deleted.")
-    return 0
-
-
-def _update_pet(args: argparse.Namespace, client: HaloClient) -> int:
+def _pet_update(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
     """Fill unspecified fields from the stored pet.
 
     Halo replaces the whole profile rather than patching it, so sending only the
@@ -571,14 +1132,12 @@ def _update_pet(args: argparse.Namespace, client: HaloClient) -> int:
     """
 
     current = client.pet(args.pet_id)
-    birthday = args.birthday if args.birthday is not None else current.get("birthday")
-    weight = args.weight_kg if args.weight_kg is not None else current.get("weightKg")
     fields = {
         "name": args.name if args.name is not None else current.get("name"),
         "color_hex": args.color_hex if args.color_hex is not None else current.get("colorHex"),
         "breed": args.breed if args.breed is not None else current.get("breed"),
-        "birthday": birthday,
-        "weight_kg": weight,
+        "birthday": args.birthday if args.birthday is not None else current.get("birthday"),
+        "weight_kg": args.weight_kg if args.weight_kg is not None else current.get("weightKg"),
     }
     missing = sorted(key for key, value in fields.items() if value in (None, ""))
     if missing:
@@ -586,61 +1145,305 @@ def _update_pet(args: argparse.Namespace, client: HaloClient) -> int:
             f"Halo requires the full pet profile and the stored pet has no "
             f"{', '.join(missing)}; pass the matching flag."
         )
-    _print_json(client.update_pet(args.pet_id, **fields))
-    return 0
+    updated = client.update_pet(args.pet_id, **fields)
+    out.note("Updated. The collar's configuration is outdated until it next syncs.")
+    out.emit(updated)
+    return EXIT_OK
 
 
-def _delete_pet(args: argparse.Namespace, client: HaloClient) -> int:
+def _pet_delete(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
     pet = client.pet(args.pet_id)
     pet_name = str(pet.get("name") or args.pet_id)
-    if not args.yes:
-        print(
+    if not _confirmed(
+        args,
+        out,
+        warning=(
             f"\nThis permanently deletes {pet_name} and the history Halo keeps under it. "
             "Halo does not return the deleted pet, so nothing here can undo it."
-        )
-        if input(f"Type the pet name ({pet_name}) to delete it: ").strip() != pet_name:
-            print("Cancelled; the pet was not deleted.")
-            return 1
+        ),
+        prompt=f"Type the pet name ({pet_name}) to delete it: ",
+        expected=pet_name,
+        cancelled="Cancelled; the pet was not deleted.",
+    ):
+        return EXIT_NO_LOGIN
     client.delete_pet(args.pet_id)
-    print(f"Deleted {pet_name}.")
-    return 0
+    out.note(f"Deleted {pet_name}.")
+    return EXIT_OK
 
 
-def _add_fence(args: argparse.Namespace, client: HaloClient) -> int:
+def _pet_colors(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    colors = client.pet_colors()
+    out.emit(
+        colors,
+        rows=colors,
+        columns=[
+            Column("NAME", "fallbackColorName"),
+            Column("HEX", "colorHex"),
+            Column("SLUG", "collarColor"),
+            Column("AVAILABLE", "isAvailable"),
+        ],
+    )
+    return EXIT_OK
+
+
+def _collar_list(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    collars = client.collars()
+    if args.full:
+        out.emit(collars)
+        return EXIT_OK
+    summary = safe_collar_summary(collars)
+    rows = [
+        {**collar, "pet": (collar.get("pet") or {}).get("name") if collar.get("pet") else None}
+        for collar in summary
+    ]
+    out.emit(
+        summary,
+        rows=rows,
+        columns=[
+            Column("SERIAL", "serialNumber"),
+            Column("PET", "pet"),
+            Column("BATTERY", "batteryChargePercent"),
+            Column("ONLINE", "online"),
+            Column("SYNC", "configurationSyncStatus"),
+            Column("ID", "id"),
+        ],
+    )
+    return EXIT_OK
+
+
+def _collar_locate(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    client.find_collar(args.collar_id)
+    out.note("Halo accepted the locate request. The collar plays its tone if reachable.")
+    return EXIT_OK
+
+
+FENCE_COLUMNS = [
+    Column("NAME", "name"),
+    Column("ENABLED", "isEnabled"),
+    Column("ZONES", "zones"),
+    Column("PETS", "petsSync"),
+    Column("ID", "id"),
+]
+
+
+def _fence_rows(fences: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            **fence,
+            "zones": len(fence.get("zones") or []),
+            "petsSync": sum(1 for entry in fence.get("petsSync") or [] if entry.get("isAssigned")),
+        }
+        for fence in fences
+    ]
+
+
+def _fence_list(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    fences = client.geofences()
+    if args.full:
+        out.emit(fences)
+        return EXIT_OK
+    summary = safe_fence_summary(fences)
+    out.emit(summary, rows=_fence_rows(summary), columns=FENCE_COLUMNS)
+    return EXIT_OK
+
+
+def _fence_add(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
     points = _points(args.point)
-    if not args.yes:
-        print(
+    if not _confirmed(
+        args,
+        out,
+        warning=(
             f"\nThis creates the fence {args.name} from {len(points)} points. It changes "
             "where the collar corrects the dog once the collar syncs. Preview the boundary "
             "in the official app if you have not verified these coordinates."
-        )
-        if input(f"Type the fence name ({args.name}) to create it: ").strip() != args.name:
-            print("Cancelled; no fence was created.")
-            return 1
+        ),
+        prompt=f"Type the fence name ({args.name}) to create it: ",
+        expected=args.name,
+        cancelled="Cancelled; no fence was created.",
+    ):
+        return EXIT_NO_LOGIN
     created = client.add_geo_fence(args.name, points)
     # Halo nests the new fence under `geoFence`, and echoing it whole would
     # print the signed thumbnail URL that every other command hides.
     fence = created.get("geoFence") if isinstance(created, dict) else None
+    out.note(f"Created {args.name}.")
     if args.full or not isinstance(fence, dict):
-        _print_json(created)
+        out.emit(created)
     else:
-        _print_json(_safe_fence_summary([fence])[0])
-    return 0
+        summary = safe_fence_summary([fence])
+        out.emit(summary[0], rows=_fence_rows(summary), columns=FENCE_COLUMNS)
+    return EXIT_OK
 
 
-def _move_fence(args: argparse.Namespace, client: HaloClient) -> int:
+def _fence_rename(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    client.rename_geo_fence(args.fence_id, args.name)
+    out.note(f"Fence renamed to {args.name}.")
+    return EXIT_OK
+
+
+def _fence_move(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
     points = _points(args.point)
-    if not args.yes:
-        print(
+    if not _confirmed(
+        args,
+        out,
+        warning=(
             f"\nThis replaces fence {args.fence_id} with a new {len(points)}-point boundary. "
             "The old boundary is not returned, and a dog relying on this fence for "
             "containment follows the new one once the collar syncs."
+        ),
+        prompt="Type the fence id to move it: ",
+        expected=args.fence_id,
+        cancelled="Cancelled; the fence was not moved.",
+    ):
+        return EXIT_NO_LOGIN
+    result = client.update_geo_fence_location(args.fence_id, points)
+    out.note("Boundary replaced. It takes effect once the collar syncs.")
+    out.emit(result)
+    return EXIT_OK
+
+
+def _fence_delete(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    if not _confirmed(
+        args,
+        out,
+        warning=(
+            f"\nThis permanently deletes fence {args.fence_id}. Halo does not return the "
+            "deleted boundary, so re-drawing it is manual, and any dog relying on it for "
+            "containment loses that boundary once the collar syncs."
+        ),
+        prompt="Type the fence id to delete it: ",
+        expected=args.fence_id,
+        cancelled="Cancelled; the fence was not deleted.",
+    ):
+        return EXIT_NO_LOGIN
+    client.delete_geo_fence(args.fence_id)
+    out.note("Fence deleted.")
+    return EXIT_OK
+
+
+def _beacon_list(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    out.emit(client.beacons())
+    return EXIT_OK
+
+
+def _walk_list(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    out.emit(client.walks(page=args.page, page_size=args.page_size))
+    return EXIT_OK
+
+
+def _notification_list(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    out.emit(client.notifications(page=args.page, page_size=args.page_size))
+    return EXIT_OK
+
+
+def _notification_read(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    client.set_notification_status(args.notification_id)
+    out.note(f"Marked {len(args.notification_id)} notification(s) read.")
+    return EXIT_OK
+
+
+def _notification_inbox(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    out.emit(client.portal_notifications())
+    return EXIT_OK
+
+
+def _correction_send(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    pet = client.pet(args.pet_id)
+    pet_name = str(pet.get("name") or args.pet_id)
+    kind = CorrectionType.parse(args.correction_type)
+    if not _confirmed(
+        args,
+        out,
+        warning=(
+            f"\nThis will send {kind.value} to {pet_name}. Halo accepted this enum in the "
+            "captured API, but its physical effect depends on the collar configuration.\n"
+            "For first tests, remove the collar from the dog and use the lowest safe "
+            "feedback level."
+        ),
+        prompt=f"Type the pet name ({pet_name}) to send exactly once: ",
+        expected=pet_name,
+        cancelled="Cancelled; no correction was sent.",
+    ):
+        return EXIT_NO_LOGIN
+    result = client.send_instant_correction(
+        args.pet_id,
+        kind,
+        command_number=args.command_number,
+        require_online=not args.skip_online_check,
+    )
+    out.note(
+        f"Halo accepted {kind.value} for {pet_name}. "
+        "Cloud acceptance does not confirm physical execution."
+    )
+    if result.get("currentCommandNumber") is not None:
+        out.note(f"Halo current command number: {result['currentCommandNumber']}")
+    out.emit(result)
+    return EXIT_OK
+
+
+def _correction_rules(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    out.emit(client.pet_correction_rules(args.pet_id))
+    return EXIT_OK
+
+
+def _correction_config(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    out.emit(client.correction_rule_configuration())
+    return EXIT_OK
+
+
+def _training_show(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    out.emit(client.training())
+    return EXIT_OK
+
+
+def _device_register(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    mobile_id = client.register_mobile_device()
+    out.note(
+        f"Registered this installation as MobileId {mobile_id}. "
+        "Corrections now send it instead of the fallback constant."
+    )
+    out.emit({"mobileId": mobile_id}, pairs={"mobileId": mobile_id})
+    return EXIT_OK
+
+
+def _parcel_lookup(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    out.note(
+        "This returns public land records: real owner names and mailing "
+        "addresses for whoever owns the land, including neighbors."
+    )
+    out.emit(
+        client.lookup_parcels(
+            args.latitude,
+            args.longitude,
+            page=args.page,
+            results_per_page=args.results_per_page,
         )
-        if input("Type the fence id to move it: ").strip() != args.fence_id:
-            print("Cancelled; the fence was not moved.")
-            return 1
-    _print_json(client.update_geo_fence_location(args.fence_id, points))
-    return 0
+    )
+    return EXIT_OK
+
+
+def _system_config(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    out.emit(client.configuration())
+    return EXIT_OK
+
+
+def _system_time(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    out.emit(client.server_time().isoformat())
+    return EXIT_OK
+
+
+def _system_videos(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    videos = client.videos()
+    if args.full:
+        out.emit(videos)
+        return EXIT_OK
+    index = _video_index(videos)
+    out.emit(
+        index,
+        rows=[{"name": name, "url": url} for name, url in index.items()],
+        columns=[Column("NAME", "name"), Column("STREAM", "url")],
+    )
+    return EXIT_OK
 
 
 def _video_index(videos: list[dict[str, Any]]) -> dict[str, Any]:
@@ -661,144 +1464,136 @@ def _video_index(videos: list[dict[str, Any]]) -> dict[str, Any]:
     return index
 
 
-def _safe_profile_summary(profile: dict[str, Any]) -> dict[str, Any]:
-    """Avoid dumping email addresses, the avatar URL, and the referral link."""
-
-    coupon = profile.get("referralCoupon")
-    return {
-        "id": profile.get("id"),
-        "userId": profile.get("userId"),
-        "firstName": profile.get("firstName"),
-        "lastName": profile.get("lastName"),
-        "hasChangeEmailRequest": profile.get("hasChangeEmailRequest"),
-        "hasCompletedQuestionnaire": profile.get("hasCompletedQuestionnaire"),
-        "hasFinishedUserGuide": profile.get("hasFinishedUserGuide"),
-        "onboardingProgressState": profile.get("onboardingProgressState"),
-        "referralCoupon": (
-            {"amount": coupon.get("amount"), "canShare": coupon.get("canShare")}
-            if isinstance(coupon, dict)
-            else None
-        ),
-    }
+# --- Plumbing -------------------------------------------------------------
 
 
-def _safe_collar_summary(collars: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Avoid dumping Wi-Fi SSIDs, hardware UUIDs, and full telemetry by default."""
+def _flag(args: argparse.Namespace, name: str, default: Any) -> Any:
+    """Read a common flag, which is absent unless it was actually passed."""
 
-    result = []
-    for collar in collars:
-        telemetry = collar.get("telemetry")
-        pet = collar.get("petInfo")
-        result.append(
-            {
-                "id": collar.get("id"),
-                "serialNumber": collar.get("serialNumber"),
-                "type": collar.get("type"),
-                "configurationSyncStatus": collar.get("configurationSyncStatus"),
-                "pet": (
-                    {"id": pet.get("id"), "name": pet.get("name")}
-                    if isinstance(pet, dict)
-                    else None
-                ),
-                "batteryChargePercent": (
-                    telemetry.get("batteryChargePercent") if isinstance(telemetry, dict) else None
-                ),
-                "online": HaloClient.collar_is_online(collar),
-            }
+    return getattr(args, name, default)
+
+
+def _store(args: argparse.Namespace) -> StateStore:
+    return StateStore(_flag(args, "state_file", None))
+
+
+def _client_secret(profile: OAuthClientProfile) -> str:
+    secret = resolve_client_secret(profile)
+    if not secret:
+        raise ValueError(
+            f"No {profile.name} client secret is available. Set "
+            f"HALO_{profile.name.upper()}_CLIENT_SECRET."
         )
-    return result
+    return secret
 
 
-def _safe_pet_summary(pets: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Avoid dumping live coordinates and signed report URLs by default."""
+def _require_input(args: argparse.Namespace, why: str) -> None:
+    if _flag(args, "no_input", False) or not sys.stdin.isatty():
+        raise ValueError(f"{why} Re-run it in a terminal without --no-input.")
 
-    result = []
-    for pet in pets:
-        collar = pet.get("collarInfo")
-        result.append(
-            {
-                "id": pet.get("id"),
-                "name": pet.get("name"),
-                "breed": pet.get("breed"),
-                "collar": (
-                    {"id": collar.get("id"), "serialNumber": collar.get("serialNumber")}
-                    if isinstance(collar, dict)
-                    else None
-                ),
-                "isCollarEverAssigned": pet.get("isCollarEverAssigned"),
-                "fencesState": pet.get("fencesState"),
-                "beaconsState": pet.get("beaconsState"),
-            }
+
+def _confirmed(
+    args: argparse.Namespace,
+    out: Output,
+    *,
+    warning: str,
+    prompt: str,
+    expected: str,
+    cancelled: str,
+) -> bool:
+    """Ask the user to type an identifier back before something irreversible.
+
+    `--yes` is the scriptable path. Without a terminal there is no way to ask, so
+    the command refuses rather than treating silence as consent.
+    """
+
+    if getattr(args, "yes", False):
+        return True
+    if _flag(args, "no_input", False) or not sys.stdin.isatty():
+        raise ValueError(
+            "This needs confirmation and stdin is not an interactive terminal. "
+            "Pass --yes if you are sure."
         )
-    return result
+    out.note(warning)
+    if input(prompt).strip() != expected:
+        out.note(cancelled)
+        return False
+    return True
 
 
-def _safe_fence_summary(fences: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Avoid dumping zone coordinates, the fence address, and signed thumbnails."""
+def _print_help(parser: argparse.ArgumentParser, topic: Sequence[str]) -> int:
+    """Serve `halo help`, `halo help pet`, and `halo help pet add`."""
 
-    result = []
-    for fence in fences:
-        zones = fence.get("zones")
-        pets_sync = fence.get("petsSync")
-        result.append(
-            {
-                "id": fence.get("id"),
-                "name": fence.get("name"),
-                "description": fence.get("description"),
-                "activityType": fence.get("activityType"),
-                "isEnabled": fence.get("isEnabled"),
-                "publicVisibilityType": fence.get("publicVisibilityType"),
-                "zones": (
-                    [
-                        {
-                            "type": zone.get("type"),
-                            "pointCount": len(zone.get("locationPoints") or []),
-                        }
-                        for zone in zones
-                        if isinstance(zone, dict)
-                    ]
-                    if isinstance(zones, list)
-                    else None
-                ),
-                "petsSync": (
-                    [
-                        {
-                            "petId": entry.get("petId"),
-                            "isAssigned": entry.get("isAssigned"),
-                            "status": entry.get("status"),
-                        }
-                        for entry in pets_sync
-                        if isinstance(entry, dict)
-                    ]
-                    if isinstance(pets_sync, list)
-                    else None
-                ),
-            }
-        )
-    return result
+    if not topic:
+        parser.print_help()
+        return EXIT_OK
+    actions = [
+        action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+    ]
+    current = parser
+    for name in topic:
+        choices = actions[0].choices if actions else {}
+        if name not in choices:
+            print(f"halo: no help for {' '.join(topic)!r}.\n", file=sys.stderr)
+            for line in _suggestions(name):
+                print(line, file=sys.stderr)
+            print("\nRun `halo help` to see every command.", file=sys.stderr)
+            return EXIT_ERROR
+        current = choices[name]
+        actions = [
+            action for action in current._actions if isinstance(action, argparse._SubParsersAction)
+        ]
+    current.print_help()
+    return EXIT_OK
 
 
-def _safe_map_summary(account_map: dict[str, Any]) -> dict[str, Any]:
-    """Summarize the map payload with the same redactions the other commands use."""
+def main(argv: Sequence[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    if not argv:
+        print(CONCISE_HELP, end="")
+        return EXIT_OK
 
-    pets = account_map.get("pets")
-    fences_info = account_map.get("geoFencesInfo")
-    fences = fences_info.get("geoFencesToDisplay") if isinstance(fences_info, dict) else None
-    corrections = account_map.get("corrections")
-    return {
-        "pets": _safe_pet_summary(pets) if isinstance(pets, list) else None,
-        "fences": _safe_fence_summary(fences) if isinstance(fences, list) else None,
-        "geoFencesTotalCount": (
-            fences_info.get("geoFencesTotalCount") if isinstance(fences_info, dict) else None
-        ),
-        # The correction records have never been observed populated, so there is
-        # no verified shape to redact; --full is the honest way to read them.
-        "correctionCount": len(corrections) if isinstance(corrections, list) else None,
-    }
+    args = parser.parse_args(argv)
+    out = Output(
+        as_json=_flag(args, "as_json", False),
+        plain=_flag(args, "plain", False),
+        quiet=_flag(args, "quiet", False),
+    )
 
+    if args.noun == "help":
+        return _print_help(parser, args.topic)
+    if args.handler is None:
+        # A noun with no verb: show that noun's own help rather than an error.
+        group_parser = _flag(args, "group_parser", None)
+        (group_parser or parser).print_help()
+        return EXIT_OK
 
-def _print_json(value: Any) -> None:
-    print(json.dumps(value, indent=2, sort_keys=True))
+    try:
+        if not args.needs_client:
+            return args.handler(args, None, out)
+        with HaloClient(store=_store(args), timezone_name=_flag(args, "timezone", None)) as client:
+            return args.handler(args, client, out)
+    except StaleCommandNumberError as exc:
+        print(f"Correction not sent: {exc}", file=sys.stderr)
+        return EXIT_STALE_COMMAND
+    except CorrectionOutcomeUnknownError as exc:
+        print(f"WARNING: {exc}", file=sys.stderr)
+        return EXIT_UNKNOWN_OUTCOME
+    except UnsafeCorrectionError as exc:
+        print(f"Safety check stopped the correction: {exc}", file=sys.stderr)
+        return EXIT_UNSAFE
+    except (HaloError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    except KeyboardInterrupt:
+        print("\nCancelled.", file=sys.stderr)
+        return EXIT_INTERRUPTED
+    except EOFError:
+        # A confirmation prompt that cannot be answered must never be treated as
+        # consent, so closed stdin cancels rather than proceeding.
+        print("Cancelled: confirmation could not be read from input.", file=sys.stderr)
+        return EXIT_INTERRUPTED
 
 
 if __name__ == "__main__":  # pragma: no cover

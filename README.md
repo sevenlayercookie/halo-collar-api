@@ -60,7 +60,7 @@ The only runtime dependency is
 The simplest headless login uses the password grant observed in Android traffic:
 
 ```bash
-halo --timezone America/Chicago login --password
+halo --timezone America/Chicago auth login --password
 ```
 
 It prompts for the account email and securely prompts for the account password.
@@ -91,7 +91,7 @@ flow remains available as a fallback.
 ## Login with the hosted browser
 
 ```bash
-halo --timezone America/Chicago login
+halo --timezone America/Chicago auth login
 ```
 
 The command uses the observed iOS profile and opens Halo's hosted login page with
@@ -108,7 +108,7 @@ off a WebInspector HAR export, a raw HTTP callback exchange, or just the 302
 response headers containing `Location`:
 
 ```bash
-halo --timezone America/Chicago login --no-browser --browser-capture
+halo --timezone America/Chicago auth login --no-browser --browser-capture
 ```
 
 Transfer the capture to the machine running this tool and enter its path. Only
@@ -119,7 +119,7 @@ validates the PKCE verifier during the token exchange.
 To bootstrap from an existing capture without putting tokens in shell history:
 
 ```bash
-halo --timezone America/Chicago login --from-refresh-token
+halo --timezone America/Chicago auth login --from-refresh-token
 ```
 
 The refresh token is prompted without echo. Halo binds refresh tokens to the
@@ -127,7 +127,7 @@ client that issued them, so pick the matching `--platform`; the stored session
 records which client it belongs to and will not be reused under another one. The
 session is stored outside the repository in an atomic state file with `0600`
 permissions on POSIX systems. On
-Linux the default is `~/.local/state/halo-collar/state.json`. Use `halo logout`
+Linux the default is `~/.local/state/halo-collar/state.json`. Use `halo auth logout`
 to remove the state and command counters.
 
 If Halo returns `invalid_grant`, the refresh token has expired, was revoked, or
@@ -135,62 +135,99 @@ the one-time authorization grant is invalid. The client stops and asks for a new
 login and removes the dead tokens while retaining non-token settings. It never
 stores the Halo account password.
 
+## Using the CLI
+
+Commands are `noun verb`:
+
+```bash
+halo                      # concise help
+halo help                 # every noun
+halo help pet             # every verb on a noun
+halo pet add --help       # one command, with examples
+```
+
+Every noun and every verb answers `-h`/`--help`, and `halo <noun>` on its own
+prints that noun's help rather than an error. Retired flat names such as `halo
+pets` are gone, but the tool tells you where each one went.
+
+These flags work on every command, before or after the verb:
+
+| Flag | Effect |
+| --- | --- |
+| `--json` | Print Halo's data as JSON instead of a table |
+| `--plain` | Tab-separated rows with no alignment, for `grep` and `awk` |
+| `--quiet`, `-q` | Suppress notices on stderr; data and errors still print |
+| `--no-input` | Never prompt; commands needing confirmation fail unless `--yes` |
+| `--state-file` | Override the owner-only credential/counter state path |
+| `--timezone` | IANA timezone sent in Halo-Client |
+
+Data goes to stdout and notices go to stderr, so `halo pet list > pets.txt`
+captures only the pets while still telling you what happened. Collections print
+as a table; payloads with no flat shape — one pet, the map, the configuration —
+print as JSON whatever you pass, because a flattened half-view of them would
+mislead. `--full` also implies JSON, since the unredacted payload is nested.
+
+Exit codes: `0` success, `1` nothing to do or the user cancelled, `2` usage or
+API error, `3` stale command number, `4` correction outcome unknown, `5` safety
+check refused, `130` interrupted.
+
 ## Read data
 
 ```bash
-halo status
-halo configuration
-halo collars
-halo pets
-halo fences
-halo pet PET_ID
-halo pet PET_ID --refresh-telemetry
-halo map
-halo map 37.4219983 -122.084
-halo walks --page 1 --page-size 30
-halo notifications --page 1 --page-size 30
-halo profile
-halo beacons
-halo subscription
-halo inbox
-halo correction-config
-halo server-time
-halo videos
+halo auth status
+halo system config
+halo collar list
+halo pet list
+halo fence list
+halo pet show PET_ID
+halo pet show PET_ID --refresh-telemetry
+halo account map
+halo account map --latitude 37.4219983 --longitude -122.084
+halo walk list --page 1 --page-size 30
+halo notification list --page 1 --page-size 30
+halo account profile
+halo beacon list
+halo account subscription
+halo notification inbox
+halo correction config
+halo system time
+halo system videos
 ```
 
-`halo videos` prints a `name -> HLS stream URL` list of the 22 videos the apps
-play — onboarding, training, and subscription screens — pulled out of the
+`halo system videos` prints a `name -> HLS stream URL` list of the 22 videos the
+apps play — onboarding, training, and subscription screens — pulled out of the
 configuration payload, with `--full` adding thumbnails and the section each came
 from. Nothing here is account data: the URLs carry no signature and
 `/configuration/` needs no login, so this is the one read command that works
 logged out, and the streams play directly in `mpv`, `ffplay`, or VLC. The same
 payload also holds the collar's 21 correction sounds and 6 vibration files as
-plain `.mp3` URLs under `halo correction-config`.
+plain `.mp3` URLs under `halo correction config`.
 
-`halo inbox` reads `/portal-notification/my/in-app/`, a different feed from the
-`/notification/my/query` history behind `halo notifications`. `halo profile`
-summarizes by default because the payload carries your email addresses, avatar
-URL, and referral link; `beacons`, `subscription`, `inbox`, and
-`correction-config` print in full because nothing in their observed payloads
-needs hiding.
+`halo notification inbox` reads `/portal-notification/my/in-app/`, a different
+feed from the `/notification/my/query` history behind `halo notification list`.
+`halo account profile` summarizes by default because the payload carries your
+email addresses, avatar URL, and referral link; `beacon list`, `account
+subscription`, `notification inbox`, and `correction config` print in full
+because nothing in their observed payloads needs hiding.
 
-`halo collars`, `halo pets`, `halo fences`, and `halo map` print privacy-reduced
-summaries rather than full Wi-Fi, coordinate, and signed-report-URL data. Pass
-`--full` to any of them for Halo's complete response. Nothing is withheld from
-you: the summary is only the default so that a command you ran to check a
-battery level does not put your home coordinates into a screenshot, a shell
-history, or a pasted bug report. The Python API always returns whole payloads.
+`halo collar list`, `halo pet list`, `halo fence list`, and `halo account map`
+print privacy-reduced summaries rather than full Wi-Fi, coordinate, and
+signed-report-URL data. Pass `--full` to any of them for Halo's complete
+response. Nothing is withheld from you: the summary is only the default so that
+a command you ran to check a battery level does not put your home coordinates
+into a screenshot, a shell history, or a pasted bug report. The Python API
+always returns whole payloads.
 
-`halo pets` reaches every pet on the account, including ones that have never had
-a collar assigned and so never appear in `halo collars`. Use `halo pet PET_ID`
-for the full object; it is unsummarized and needs no `--full`.
+`halo pet list` reaches every pet on the account, including ones that have never
+had a collar assigned and so never appear in `halo collar list`. Use `halo pet
+show PET_ID` for the full object; it is unsummarized and needs no `--full`.
 
-`halo fences` lists the account's geofences, which Halo returns only inside the
-map payload. The summary keeps names, enabled state, zone types with a point
+`halo fence list` lists the account's geofences, which Halo returns only inside
+the map payload. The summary keeps names, enabled state, zone types with a point
 count, and per-pet sync status, and drops the zone polygons, the fence address,
 and the signed thumbnail URL.
 
-`halo map` calls `/account/my/map`, which the app polls on its home screen. One
+`halo account map` calls `/account/my/map`, which the app polls on its home screen. One
 response returns `pets` (each with its collar embedded), `geoFencesInfo`, and
 `corrections`, so prefer it over several separate calls when polling. The apps
 always send a viewport centre, but Halo returns the whole account without one,
@@ -201,7 +238,7 @@ ever shown that list populated and there is no verified shape to trust.
 ## Locate a collar
 
 ```bash
-halo find-collar COLLAR_ID
+halo collar locate COLLAR_ID
 ```
 
 This plays the collar's locate tone. It is a physical action, but an
@@ -274,32 +311,32 @@ returns no geometry.
 ### Pets
 
 Halo replaces a pet's profile wholesale rather than patching it, so `update_pet`
-requires all five fields. `halo pet-update` reads the pet first and fills in
+requires all five fields. `halo pet update` reads the pet first and fills in
 whatever you did not pass, which keeps a single `--weight-kg` from blanking the
 name and breed:
 
 ```bash
-halo pet-colors                      # colorHex must come from this list
-halo pet-add --name Scout --color-hex "#FF7A00" --breed goldenretriever \
+halo pet colors                      # colorHex must come from this list
+halo pet add --name Scout --color-hex "#FF7A00" --breed goldenretriever \
     --birthday 2021-04-17 --weight-kg 28.5
-halo pet-update PET_ID --weight-kg 29.2
-halo pet-delete PET_ID
+halo pet update PET_ID --weight-kg 29.2
+halo pet delete PET_ID
 ```
 
 Saving marks the collar's configuration `outdated` until it next syncs. A new
-pet has no collar until one is bound, so it appears in `halo pets` but not in
-`halo collars`.
+pet has no collar until one is bound, so it appears in `halo pet list` but not in
+`halo collar list`.
 
 `delete_pet()` removes the pet and the history Halo keeps under it. Halo answers
 200 with an empty body rather than returning what it deleted, so nothing here
-undoes it; `halo pet-delete` asks you to type the pet's name first.
+undoes it; `halo pet delete` asks you to type the pet's name first.
 
 ### Fences
 
 Halo has no endpoint that lists fences on their own. `geofences()` and `halo
 fences` read the `geoFencesInfo.geoFencesToDisplay` array out of the map payload,
 so listing fences costs one `/account/my/map` call. Note `geoFencesTotalCount`:
-`halo map` reports it, and a count larger than the returned array means Halo
+`halo account map` reports it, and a count larger than the returned array means Halo
 truncated the list.
 
 Fence geometry is a list of `(latitude, longitude)` corners; Halo needs at least
@@ -318,9 +355,9 @@ From the CLI, boundary corners are repeated `--point LAT,LON` flags in order,
 and at least three are required:
 
 ```bash
-halo fence-add "Back yard" --point 40.0001,-75.0001 \
+halo fence add "Back yard" --point 40.0001,-75.0001 \
     --point 40.0002,-75.00015 --point 40.0003,-75.00005
-halo fence-move FENCE_ID --point 40.0001,-75.0001 \
+halo fence move FENCE_ID --point 40.0001,-75.0001 \
     --point 40.0002,-75.00015 --point 40.0004,-75.00005
 ```
 
@@ -341,7 +378,7 @@ device details to `/account/mobile-data` after login and reusing the integer
 Halo returns:
 
 ```bash
-halo register-device
+halo device register
 ```
 
 The id is stored in the state file and used by later corrections.
@@ -362,7 +399,7 @@ observed to work anyway, so what Halo does with the field is unknown.
 `generate_ecommerce_login_magic_code()` mints a single-use code that signs the
 account into the Halo store. It is a credential — do not log it.
 
-`lookup_parcels()` and `halo parcels LAT LON` proxy a third-party property
+`lookup_parcels()` and `halo parcel lookup --latitude LAT --longitude LON` proxy a third-party property
 database that the fence editor uses to detect buildings. Responses contain real
 owner names and mailing addresses for whoever owns the land, including
 neighbors, so the command prints a warning to stderr and is not summarized —
@@ -391,14 +428,14 @@ Observed correction types:
 The first call for a pet needs the **next known** command number:
 
 ```bash
-halo correct PET_ID GoodBehavior --command-number 13
+halo correction send PET_ID GoodBehavior --command-number 13
 ```
 
 The counter is reserved atomically before network dispatch and subsequent calls
 increment it:
 
 ```bash
-halo correct PET_ID ReturnWhistle
+halo correction send PET_ID ReturnWhistle
 ```
 
 The CLI checks that the assigned collar reports `socketconnected`, synchronizes
