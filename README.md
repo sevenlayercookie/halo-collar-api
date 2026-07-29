@@ -162,10 +162,38 @@ These flags work on every command, before or after the verb:
 | `--timezone` | IANA timezone sent in Halo-Client |
 
 Data goes to stdout and notices go to stderr, so `halo pet list > pets.txt`
-captures only the pets while still telling you what happened. Collections print
-as a table; payloads with no flat shape — one pet, the map, the configuration —
-print as JSON whatever you pass, because a flattened half-view of them would
-mislead. `--full` also implies JSON, since the unredacted payload is nested.
+captures only the pets while still telling you what happened.
+
+Output is a table wherever the payload is shallow enough for one. Scalar fields
+become a `FIELD`/`VALUE` table, an embedded list of flat records becomes its own
+table under its field name, and a small nested object becomes a table of its
+own, in the same key order `--json` uses:
+
+```
+$ halo account subscription
+FIELD                  VALUE
+accessLevel            basic
+accountActivationDate  2026-06-09T12:45:45.8419848Z
+
+FEATURES
+ID                        ISENABLED
+viewpetbehaviortraining   false
+refreshtelemetry          true
+…
+```
+
+Anything a table would misrepresent stays JSON: one pet, the map, the
+configuration, a notification row carrying twenty-one columns, a parcel record
+whose body is a 1500-character string. The rule is mechanical — too deep, more
+than ten columns, more than 200 rows, or wider than 120 characters and the
+payload is left as JSON rather than wrapped into a mangled grid. A payload that
+is metadata around one oversized collection, like a page of walks, still shows
+the metadata as a table and leaves that collection as JSON beneath it.
+
+`--full` always implies JSON, since the unredacted payload is nested. Booleans
+and nulls print as Halo spells them, `true` and `null`, rather than as English;
+a `-` in a column means there was nothing to show, which is not the same as Halo
+returning null.
 
 Exit codes: `0` success, `1` nothing to do or the user cancelled, `2` usage or
 API error, `3` stale command number, `4` correction outcome unknown, `5` safety
