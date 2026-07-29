@@ -168,6 +168,18 @@ class HaloClient:
 
         return self._get_object("/configuration/", authenticated=False)
 
+    def videos(self) -> list[dict[str, Any]]:
+        """List the streaming videos the apps play, gathered from the configuration.
+
+        Halo scatters these through the payload — onboarding, training, and
+        subscription screens — as objects holding an HLS stream and a thumbnail.
+        Neither the configuration nor the URLs are authenticated, so unlike pet
+        reports and fence thumbnails these carry no signature and play without a
+        login.
+        """
+
+        return _video_assets(self.configuration())
+
     def collars(self) -> list[dict[str, Any]]:
         """List collars owned by the authenticated account."""
 
@@ -875,6 +887,33 @@ class HaloClient:
                 "Halo returned a response that was not valid JSON.",
                 status_code=response.status_code,
             ) from exc
+
+
+def _video_assets(configuration: Any) -> list[dict[str, Any]]:
+    """Find every ``videoStreamUrl`` in the configuration, wherever Halo moves it."""
+
+    found: list[dict[str, Any]] = []
+
+    def walk(node: Any, trail: tuple[str, ...]) -> None:
+        if isinstance(node, dict):
+            stream = node.get("videoStreamUrl")
+            if isinstance(stream, str) and stream:
+                found.append(
+                    {
+                        "name": trail[-1] if trail else "",
+                        "section": ".".join(trail[:-1]),
+                        "videoStreamUrl": stream,
+                        "thumbnailUrl": node.get("thumbnailUrl"),
+                    }
+                )
+            for key, value in node.items():
+                walk(value, (*trail, key))
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, (*trail, str(index)))
+
+    walk(configuration, ())
+    return found
 
 
 def _identifier(value: str) -> str:

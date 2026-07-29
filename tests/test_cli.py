@@ -336,6 +336,34 @@ def test_fence_add_summarizes_the_nested_fence_halo_returns(capsys) -> None:
     assert "SECRETSIG" in capsys.readouterr().out
 
 
+def test_video_index_qualifies_only_the_names_that_repeat() -> None:
+    index = cli._video_index(
+        [
+            {
+                "name": "introVideo",
+                "section": "lms",
+                "videoStreamUrl": "https://cdn.example/lms-intro.m3u8",
+            },
+            {
+                "name": "introVideo",
+                "section": "onboarding",
+                "videoStreamUrl": "https://cdn.example/onboarding-intro.m3u8",
+            },
+            {
+                "name": "packWalkVideo",
+                "section": "subscription",
+                "videoStreamUrl": "https://cdn.example/pack-walk.m3u8",
+            },
+        ]
+    )
+
+    assert index == {
+        "lms.introVideo": "https://cdn.example/lms-intro.m3u8",
+        "onboarding.introVideo": "https://cdn.example/onboarding-intro.m3u8",
+        "packWalkVideo": "https://cdn.example/pack-walk.m3u8",
+    }
+
+
 def test_pet_delete_cancels_unless_the_name_is_typed(monkeypatch, capsys) -> None:
     class FakeClient:
         def __init__(self):
