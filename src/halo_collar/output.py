@@ -182,6 +182,9 @@ class Output:
         """Report a state change or a caveat. Never part of the piped output."""
 
         if not self.quiet:
+            # stdout is block-buffered when redirected while stderr is not, so
+            # without this a footer note overtakes the table it belongs under.
+            self.stdout.flush()
             print(message, file=self.stderr)
 
     def json(self, value: Any) -> None:

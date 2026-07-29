@@ -93,7 +93,7 @@ RETIRED_COMMANDS = {
     "server-time": "halo system time",
     "status": "halo auth status",
     "subscription": "halo account subscription",
-    "videos": "halo system videos",
+    "videos": "halo video list",
     "walks": "halo walk list",
 }
 
@@ -124,7 +124,8 @@ NOUNS
   training      Training course progress
   device        Register this installation with Halo
   parcel        Look up land records the fence editor uses
-  system        Public configuration, server clock, and video streams
+  video         Onboarding and training video streams
+  system        Public configuration and the server clock
 
 Output is JSON with --json, and a table otherwise. Data goes to stdout;
 notices and errors go to stderr.
@@ -344,6 +345,7 @@ def build_parser() -> argparse.ArgumentParser:
     _build_training(subparsers)
     _build_device(subparsers)
     _build_parcel(subparsers)
+    _build_video(subparsers)
     _build_system(subparsers)
 
     help_parser = subparsers.add_parser(
@@ -747,13 +749,24 @@ def _build_notification(subparsers: Any) -> None:
             "and the in-app portal messages behind `inbox`."
         ),
     )
-    listing = _leaf(
-        notification,
-        "list",
-        help_text="List notification history.",
-        description="List the notification history, one page at a time.",
-        examples="  halo notification list\n  halo notification list --page 2",
-        handler=_notification_list,
+    listing = _with_full(
+        _leaf(
+            notification,
+            "list",
+            help_text="List notification history.",
+            description=(
+                "List the notification history, one page at a time. Halo sends every "
+                "column for every notification type and nulls the ones that do not "
+                "apply, so the table shows the field each type actually populates; "
+                "--full has all twenty-one, plus the paging envelope."
+            ),
+            examples=(
+                "  halo notification list\n"
+                "  halo notification list --page 2 --page-size 10\n"
+                "  halo notification list --full"
+            ),
+            handler=_notification_list,
+        )
     )
     listing.add_argument("--page", type=int, default=1, help="Page number (default: 1).")
     listing.add_argument("--page-size", type=int, default=30, help="Rows per page (default: 30).")
@@ -916,7 +929,7 @@ def _build_system(subparsers: Any) -> None:
     system = _group(
         subparsers,
         "system",
-        help_text="Public configuration, server clock, and video streams.",
+        help_text="Public configuration and the server clock.",
         description="Read what Halo publishes about itself rather than about your account.",
     )
     _leaf(
@@ -935,18 +948,30 @@ def _build_system(subparsers: Any) -> None:
         examples="  halo system time",
         handler=_system_time,
     )
+
+
+def _build_video(subparsers: Any) -> None:
+    video = _group(
+        subparsers,
+        "video",
+        help_text="List the app's onboarding and training video streams.",
+        description=(
+            "The videos the apps play. They come out of the public configuration, so "
+            "unlike everything else here they are not account data."
+        ),
+    )
     _with_full(
         _leaf(
-            system,
-            "videos",
+            video,
+            "list",
             help_text="List the app's video streams.",
             description=(
                 "List the onboarding, training, and subscription videos as name and HLS "
                 "URL. The streams are unsigned and the configuration needs no login, so "
                 "this works logged out."
             ),
-            examples="  halo system videos\n  halo system videos --full",
-            handler=_system_videos,
+            examples="  halo video list\n  halo video list --full\n  halo video list --plain",
+            handler=_video_list,
         )
     )
 
@@ -1331,8 +1356,78 @@ def _walk_list(args: argparse.Namespace, client: HaloClient, out: Output) -> int
     return EXIT_OK
 
 
+NOTIFICATION_COLUMNS = [
+    Column("WHEN", "when"),
+    Column("PET", "pet"),
+    Column("TYPE", "type"),
+    Column("DETAIL", "detail"),
+    Column("STATUS", "status"),
+    Column("ID", "id"),
+]
+
+
+def _short_time(value: Any) -> Any:
+    """Trim Halo's ISO timestamp to the minute, without pretending to parse it."""
+
+    if isinstance(value, str) and len(value) >= 16 and value[10] == "T":
+        return f"{value[:10]} {value[11:16]}"
+    return value
+
+
+def _notification_detail(row: dict[str, Any]) -> Any:
+    """The one field this notification's type actually populates.
+
+    Halo sends every column for every type and leaves the irrelevant ones null,
+    so a useful table has to pick. Anything unrecognized falls back to the
+    title, and `--full` still has all twenty-one fields.
+    """
+
+    if row.get("batteryChargePercent") is not None:
+        return f"{row['batteryChargePercent']}% battery"
+    if row.get("correctionsCount"):
+        return f"{row['correctionsCount']} corrections"
+    if row.get("notificationZone"):
+        return row["notificationZone"]
+    if row.get("duration"):
+        return row["duration"]
+    beacon = row.get("beacon")
+    if isinstance(beacon, dict) and beacon.get("name"):
+        return beacon["name"]
+    return row.get("title") or row.get("body")
+
+
+def _notification_row(row: dict[str, Any]) -> dict[str, Any]:
+    pet = row.get("pet")
+    return {
+        "when": _short_time(row.get("date")),
+        "pet": pet.get("name") if isinstance(pet, dict) else None,
+        "type": row.get("type"),
+        "detail": _notification_detail(row),
+        "status": row.get("status"),
+        "id": row.get("id"),
+    }
+
+
+def _page_note(page: dict[str, Any], noun: str) -> str:
+    number = page.get("pageNumber")
+    total_pages = page.get("totalNumberOfPages")
+    total_items = page.get("totalNumberOfItems")
+    return f"Page {number} of {total_pages} ({total_items} {noun})."
+
+
 def _notification_list(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
-    out.emit(client.notifications(page=args.page, page_size=args.page_size))
+    page = client.notifications(page=args.page, page_size=args.page_size)
+    results = page.get("results") if isinstance(page, dict) else None
+    if args.full or not isinstance(results, list):
+        out.emit(page)
+        return EXIT_OK
+    out.emit(
+        results,
+        rows=[_notification_row(row) for row in results],
+        columns=NOTIFICATION_COLUMNS,
+    )
+    # Paging is metadata about the request, not part of the data being piped.
+    out.note(_page_note(page, "notifications"))
     return EXIT_OK
 
 
@@ -1432,7 +1527,7 @@ def _system_time(args: argparse.Namespace, client: HaloClient, out: Output) -> i
     return EXIT_OK
 
 
-def _system_videos(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+def _video_list(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
     videos = client.videos()
     if args.full:
         out.emit(videos)
