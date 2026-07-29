@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import uuid
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
@@ -89,6 +90,14 @@ class HaloClient:
             stored_auth.get("app_version") if stored_client_id == self.client_id else None
         )
         self.app_version = app_version or stored_app_version or self.profile.app_version
+        # Halo assigns this when a device registers; corrections carry it. The
+        # observed value differs per installation, so a stored one always beats
+        # the constant this client falls back to.
+        stored_mobile_id = settings.get("mobile_id")
+        try:
+            self.mobile_id = int(stored_mobile_id) if stored_mobile_id else DEFAULT_MOBILE_ID
+        except (TypeError, ValueError):
+            self.mobile_id = DEFAULT_MOBILE_ID
         self.api_base_url = api_base_url.rstrip("/")
         self.auth_base_url = auth_base_url
         self._parallel_call_version = "0"
@@ -208,6 +217,48 @@ class HaloClient:
             params["viewport.center.latitude"] = str(float(latitude))
             params["viewport.center.longitude"] = str(float(longitude))
         return self._get_object("/account/my/map", params=params)
+
+    def register_mobile_device(
+        self,
+        *,
+        model: str | None = None,
+        manufacturer: str | None = None,
+        version_string: str | None = None,
+        platform_name: str | None = None,
+        idiom: str = "Phone",
+    ) -> int:
+        """Register this installation as a device and store the ``mobileId`` Halo assigns.
+
+        The apps call this once after login and then send the returned id as
+        ``MobileId`` on every instant correction. ``InternalMobileId`` is the
+        same per-installation UUID this client already sends as ``appInstanceId``
+        in the Halo-Client header, so registering twice re-reads one id rather
+        than accumulating devices. Corrections fall back to
+        :data:`DEFAULT_MOBILE_ID` until this has been called.
+
+        ``Platform`` follows the OAuth profile because Halo pairs it with the
+        client id, but the hardware fields describe the machine actually running
+        this client rather than inventing a handset. Override them if you would
+        rather Halo's device list name something else.
+        """
+
+        value = self._post_object(
+            "/account/mobile-data",
+            json_body={
+                "InternalMobileId": self.app_instance_id,
+                "Model": model or platform.machine() or "unknown",
+                "Manufacturer": manufacturer or platform.system() or "unknown",
+                "VersionString": version_string or platform.release() or "unknown",
+                "Platform": platform_name or self.profile.name,
+                "Idiom": idiom,
+            },
+        )
+        mobile_id = value.get("mobileId")
+        if not isinstance(mobile_id, int) or isinstance(mobile_id, bool):
+            raise HaloAPIError("Halo did not return a usable mobileId.")
+        self.mobile_id = mobile_id
+        self.store.update_settings(mobile_id=str(mobile_id))
+        return mobile_id
 
     def geofences(self) -> list[dict[str, Any]]:
         """List the account's geofences, which Halo returns only on the map payload."""
@@ -623,7 +674,7 @@ class HaloClient:
         reserved_number = self.store.reserve_command_number(pet_id, command_number)
         expiration = server_now + timedelta(seconds=kind.expiration_seconds)
         body = {
-            "MobileId": DEFAULT_MOBILE_ID,
+            "MobileId": self.mobile_id,
             "CommandNumber": reserved_number,
             "ExpirationDate": _format_utc(expiration),
             "CorrectionType": kind.value,
