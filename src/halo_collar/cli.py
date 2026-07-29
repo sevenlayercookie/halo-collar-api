@@ -32,6 +32,21 @@ from .models import CorrectionType
 from .storage import StateStore
 
 
+def _with_full(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Offer the unredacted payload on a command that summarizes by default.
+
+    Everything Halo returns stays reachable; the flag only keeps coordinates,
+    signed URLs, and Wi-Fi details out of terminal output nobody asked for.
+    """
+
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Print Halo's complete response, including GPS coordinates and signed URLs.",
+    )
+    return parser
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="halo",
@@ -79,20 +94,24 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("logout", help="Delete locally stored tokens and command counters.")
     subparsers.add_parser("status", help="Show local login status without revealing tokens.")
     subparsers.add_parser("configuration", help="Fetch public Halo configuration.")
-    subparsers.add_parser("collars", help="List collars on the account.")
+    _with_full(subparsers.add_parser("collars", help="List collars on the account."))
 
-    subparsers.add_parser("pets", help="List every pet, including pets with no collar.")
+    _with_full(subparsers.add_parser("pets", help="List every pet, including pets with no collar."))
+
+    _with_full(subparsers.add_parser("fences", help="List the geofences on the account."))
 
     pet = subparsers.add_parser("pet", help="Fetch one pet.")
     pet.add_argument("pet_id")
     pet.add_argument("--refresh-telemetry", action="store_true")
 
-    account_map = subparsers.add_parser(
-        "map",
-        help="Fetch pets, fences, and recent corrections in one call.",
+    account_map = _with_full(
+        subparsers.add_parser(
+            "map",
+            help="Fetch pets, fences, and recent corrections in one call.",
+        )
     )
-    account_map.add_argument("latitude", type=float)
-    account_map.add_argument("longitude", type=float)
+    account_map.add_argument("latitude", type=float, nargs="?")
+    account_map.add_argument("longitude", type=float, nargs="?")
     account_map.add_argument("--refresh-telemetry", action="store_true")
     account_map.add_argument("--max-corrections", type=int, default=20)
 
@@ -178,20 +197,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.command == "configuration":
                 _print_json(client.configuration())
             elif args.command == "collars":
-                _print_json(_safe_collar_summary(client.collars()))
+                collars = client.collars()
+                _print_json(collars if args.full else _safe_collar_summary(collars))
             elif args.command == "pets":
-                _print_json(_safe_pet_summary(client.pets()))
+                pets = client.pets()
+                _print_json(pets if args.full else _safe_pet_summary(pets))
+            elif args.command == "fences":
+                fences = client.geofences()
+                _print_json(fences if args.full else _safe_fence_summary(fences))
             elif args.command == "pet":
                 _print_json(client.pet(args.pet_id, refresh_telemetry=args.refresh_telemetry))
             elif args.command == "map":
-                _print_json(
-                    client.account_map(
-                        args.latitude,
-                        args.longitude,
-                        refresh_telemetry=args.refresh_telemetry,
-                        max_corrections_count=args.max_corrections,
-                    )
+                account_map = client.account_map(
+                    args.latitude,
+                    args.longitude,
+                    refresh_telemetry=args.refresh_telemetry,
+                    max_corrections_count=args.max_corrections,
                 )
+                _print_json(account_map if args.full else _safe_map_summary(account_map))
             elif args.command == "walks":
                 _print_json(client.walks(page=args.page, page_size=args.page_size))
             elif args.command == "notifications":
@@ -431,6 +454,70 @@ def _safe_pet_summary(pets: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return result
+
+
+def _safe_fence_summary(fences: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Avoid dumping zone coordinates, the fence address, and signed thumbnails."""
+
+    result = []
+    for fence in fences:
+        zones = fence.get("zones")
+        pets_sync = fence.get("petsSync")
+        result.append(
+            {
+                "id": fence.get("id"),
+                "name": fence.get("name"),
+                "description": fence.get("description"),
+                "activityType": fence.get("activityType"),
+                "isEnabled": fence.get("isEnabled"),
+                "publicVisibilityType": fence.get("publicVisibilityType"),
+                "zones": (
+                    [
+                        {
+                            "type": zone.get("type"),
+                            "pointCount": len(zone.get("locationPoints") or []),
+                        }
+                        for zone in zones
+                        if isinstance(zone, dict)
+                    ]
+                    if isinstance(zones, list)
+                    else None
+                ),
+                "petsSync": (
+                    [
+                        {
+                            "petId": entry.get("petId"),
+                            "isAssigned": entry.get("isAssigned"),
+                            "status": entry.get("status"),
+                        }
+                        for entry in pets_sync
+                        if isinstance(entry, dict)
+                    ]
+                    if isinstance(pets_sync, list)
+                    else None
+                ),
+            }
+        )
+    return result
+
+
+def _safe_map_summary(account_map: dict[str, Any]) -> dict[str, Any]:
+    """Summarize the map payload with the same redactions the other commands use."""
+
+    pets = account_map.get("pets")
+    fences_info = account_map.get("geoFencesInfo")
+    fences = fences_info.get("geoFencesToDisplay") if isinstance(fences_info, dict) else None
+    corrections = account_map.get("corrections")
+    return {
+        "pets": _safe_pet_summary(pets) if isinstance(pets, list) else None,
+        "fences": _safe_fence_summary(fences) if isinstance(fences, list) else None,
+        "geoFencesTotalCount": (
+            fences_info.get("geoFencesTotalCount") if isinstance(fences_info, dict) else None
+        ),
+        # The correction records have has no stable populated shape, so there is
+        # no verified shape to redact; --full is the honest way to read them.
+        "correctionCount": len(corrections) if isinstance(corrections, list) else None,
+    }
 
 
 def _print_json(value: Any) -> None:

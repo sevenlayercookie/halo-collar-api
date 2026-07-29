@@ -401,6 +401,48 @@ def test_account_map_sends_the_captured_viewport_parameters(tmp_path) -> None:
     assert requests[0].headers["Halo-Amplitude-SessionId"] == "1700000000000"
 
 
+def test_geofences_read_the_map_without_a_viewport(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "pets": [],
+                "corrections": [],
+                "geoFencesInfo": {
+                    "geoFencesToDisplay": [{"id": "fence-1", "name": "Home"}],
+                    "geoFencesTotalCount": 1,
+                },
+            },
+        )
+
+    client = _stub_client(tmp_path, handler)
+    assert client.geofences() == [{"id": "fence-1", "name": "Home"}]
+
+    assert requests[0].url.path == "/account/my/map"
+    query = parse_qs(requests[0].url.query.decode())
+    assert query == {"RefreshTelemetry": ["False"], "MaxCorrectionsCount": ["20"]}
+
+
+def test_account_map_rejects_half_a_viewport(tmp_path) -> None:
+    client = _stub_client(tmp_path, lambda request: httpx.Response(200, json={}))
+
+    with pytest.raises(ValueError):
+        client.account_map(37.4219983)
+
+
+def test_geofences_reject_an_unexpected_shape(tmp_path) -> None:
+    client = _stub_client(
+        tmp_path,
+        lambda request: httpx.Response(200, json={"geoFencesInfo": {"geoFencesToDisplay": {}}}),
+    )
+
+    with pytest.raises(HaloAPIError):
+        client.geofences()
+
+
 def test_paged_endpoints_use_halos_inconsistent_parameter_casing(tmp_path) -> None:
     requests: list[httpx.Request] = []
 
