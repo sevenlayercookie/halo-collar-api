@@ -2,6 +2,7 @@
 # identifiers, and exact location data.
 private-logs/
 android-har/
+nocommit-docs/
 
 # Local Claude worktrees and metadata.
 .claude/
