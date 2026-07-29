@@ -58,3 +58,43 @@ def test_password_login_prompts_securely_and_stores_android_session(
     assert state["settings"]["timezone"] == "America/Chicago"
     assert "person@example.com" not in state_path.read_text()
     assert "account-password" not in state_path.read_text()
+
+
+def test_pet_summary_hides_coordinates_and_report_urls() -> None:
+    pets = [
+        {
+            "id": "pet-1",
+            "name": "Alpha",
+            "breed": "goldenretriever",
+            "collarInfo": None,
+            "isCollarEverAssigned": False,
+            "fencesState": "allapplied",
+            "beaconsState": "notapplied",
+            "telemetry": None,
+            "reports": [{"id": "report-1", "url": "https://signed.example/report-1"}],
+        },
+        {
+            "id": "pet-2",
+            "name": "Bravo",
+            "breed": "irishsetter",
+            "collarInfo": {
+                "id": "collar-1",
+                "serialNumber": "SN-1",
+                "wiFiExtendedSettings": {"ssid": "Home Network"},
+            },
+            "isCollarEverAssigned": True,
+            "fencesState": "allapplied",
+            "beaconsState": "notapplied",
+            "telemetry": {"latitude": 40.0001, "longitude": -75.0001},
+            "reports": [{"id": "report-2", "url": "https://signed.example/report-2"}],
+        },
+    ]
+
+    summary = cli._safe_pet_summary(pets)
+
+    assert summary[0]["collar"] is None
+    assert summary[0]["isCollarEverAssigned"] is False
+    assert summary[1]["collar"] == {"id": "collar-1", "serialNumber": "SN-1"}
+    rendered = json.dumps(summary)
+    for secret in ("40.0001", "-75.0001", "signed.example", "Home Network"):
+        assert secret not in rendered
