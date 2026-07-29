@@ -38,6 +38,26 @@ class HaloAPIError(HaloError):
         self.path = path
 
 
+class HaloSignalRError(HaloError):
+    """The Halo live-event connection failed."""
+
+
+class SignalRNegotiationError(HaloSignalRError):
+    """A SignalR negotiation response was unsuccessful or malformed."""
+
+
+class SignalRConnectionError(HaloSignalRError):
+    """The live-event connection could not be established or maintained."""
+
+
+class SignalRProtocolError(HaloSignalRError):
+    """The server sent a SignalR frame this client could not safely interpret."""
+
+
+class SignalRBackpressureError(HaloSignalRError):
+    """The consumer did not drain live events quickly enough."""
+
+
 class UnsafeCorrectionError(HaloError):
     """A correction was stopped because a safety precondition was not met."""
 

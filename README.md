@@ -20,9 +20,11 @@ Implemented, supported functionality:
 - Halo server-clock synchronization
 - Collar locate tone and push-notification registration
 - One-shot instant corrections for the six supported correction enums
+- Async SignalR streams for live telemetry, data-state, collar-sync, and
+  notification-hub events
 
-SignalR/WebSocket support, BLE rolling codes, DGNSS forwarding, walk recording,
-beacon mutations, and collar provisioning are not implemented.
+BLE rolling codes, DGNSS forwarding, walk recording, beacon mutations, and
+collar provisioning are not implemented.
 
 ## Safety and privacy
 
@@ -52,8 +54,9 @@ python -m venv .venv
 python -m pip install -e .
 ```
 
-The only runtime dependency is
-[HTTPX](https://www.python-httpx.org/). Python 3.10 or newer is required.
+Runtime networking uses [HTTPX](https://www.python-httpx.org/) for HTTP and
+[websockets](https://websockets.readthedocs.io/) for SignalR. Python 3.10 or
+newer is required.
 
 ## Login with email and password
 
@@ -153,8 +156,8 @@ These flags work on every command, before or after the verb:
 
 | Flag | Effect |
 | --- | --- |
-| `--json` | Print Halo's data as JSON instead of a table |
-| `--plain` | Tab-separated rows with no alignment, for `grep` and `awk` |
+| `--json` | Print Halo's data as JSON instead of a table; live streams are already JSONL |
+| `--plain` | Tab-separated rows with no alignment, for `grep` and `awk`; live streams remain JSONL |
 | `--quiet`, `-q` | Suppress notices on stderr; data and errors still print |
 | `--no-input` | Never prompt; commands needing confirmation fail unless `--yes` |
 | `--state-file` | Override the owner-only credential/counter state path |
@@ -261,6 +264,33 @@ always send a viewport centre, but Halo returns the whole account without one,
 so the coordinates are optional here and on `HaloClient.account_map`. The
 summary counts `corrections` rather than redacting them, because no capture has
 ever shown that list populated and there is no verified shape to trust.
+
+## Stream live events
+
+The CLI can keep either supported SignalR hub open and print one compact JSON
+object per line until `Ctrl-C`:
+
+```bash
+halo live telemetry
+halo live notifications
+
+# Filters can be combined; repeat --target to allow more than one method.
+halo live telemetry --pet-id PET_ID --target HandleIoTTelemetry
+```
+
+Every line contains Halo's complete invocation plus a `hub` field:
+
+```json
+{"arguments":[{"petId":"PET_ID"}],"hub":"TelemetryHub","target":"HandleIoTTelemetry","type":1}
+```
+
+The output is always JSON Lines, regardless of `--json` or `--plain`, so it can
+be piped directly into tools such as `jq`. Status and privacy notices go to
+stderr and can be suppressed with `--quiet`. The event payload is deliberately
+unredacted and telemetry may contain precise pet locations; take care when
+redirecting, logging, or sharing it. The client refreshes authentication,
+maintains heartbeats, and renegotiates automatically after transient
+disconnects.
 
 ## Locate a collar
 
@@ -435,8 +465,7 @@ is a JSON-encoded *string* that must be parsed a second time.
 
 ### Not implemented
 
-This client is REST-only. The apps also open SignalR websockets for live
-telemetry, talk to the collar over BLE, and drive flows we could not reproduce
+The apps also talk to the collar over BLE and drive flows we could not reproduce
 without extra hardware. See the [Roadmap](#roadmap) for what is missing and why.
 
 ## Send a correction
@@ -523,13 +552,48 @@ with HaloClient() as halo:
 Read responses remain dictionaries because the upstream schema can
 change independently of this package.
 
+## Live events with SignalR
+
+`HaloSignalRClient` is an async, receive-only companion to `HaloClient`. It
+performs the captured Halo-to-Azure two-stage negotiation, completes the JSON
+SignalR handshake, sends keepalives, and repeats the complete negotiation after
+a transient disconnect so that neither the Halo access token nor Azure's
+short-lived connection token is reused incorrectly.
+
+```python
+import asyncio
+
+from halo_collar import HaloClient, HaloSignalRClient, SignalRHub
+
+
+async def follow() -> None:
+    with HaloClient() as halo:
+        async with HaloSignalRClient(halo, hub=SignalRHub.TELEMETRY) as live:
+            async for event in live:
+                print(event.target, event.pet_id, event.sequence_code)
+
+
+asyncio.run(follow())
+```
+
+Telemetry events arrive as `SignalREvent` objects. `target` is the server method
+(`HandleIoTTelemetry`, `HandleDataStateChanged`, or
+`HandleCollarDataSynchronized` in supported API), `arguments` and `raw`
+preserve Halo's complete payload, and the `pet_id` and `sequence_code`
+properties pull out the two common routing fields without hiding anything.
+Pass `SignalRHub.NOTIFICATIONS` to connect to `NotificationHub`.
+
+The reader runs in a background task so brief work by the consumer does not
+stop socket heartbeats. Its queue is bounded: a consumer that stays behind
+raises `SignalRBackpressureError` rather than silently dropping position
+updates. One `HaloSignalRClient` supports one event consumer; create a second
+client to consume the other hub concurrently.
+
 ## Roadmap
 
 Nothing here is implemented. Everything in the first two groups is unspecified from
-API behavior or response payloads currently support, not from documentation, so treat the
-request shapes as unknown until support is added. The SignalR entry under
-"Beyond REST" is the exception: its handshake and message shapes were captured in
-full and are documented below.
+API behavior or response payloads currently support, not from documentation, so treat
+the request shapes as unknown until support is added.
 
 ### Blocked on hardware or conditions we could not reproduce
 
@@ -564,35 +628,10 @@ endpoint exists to set them:
   firmware feature list also advertises `fota`.
 - **Calibration.** The firmware advertises `gpscalibration`,
   `compasscalibration`, and `manualgpscalibration`.
-- **Pet deletion**, and account/profile edits implied by `hasChangeEmailRequest`,
+- **Account/profile edits** implied by `hasChangeEmailRequest`,
   `hasCompletedQuestionnaire`, and `hasFinishedUserGuide`.
 
 ### Beyond REST
-
-- **SignalR live telemetry.** The highest-value item, and the only one here whose
-  protocol is already fully supported rather than unspecified, so it needs no further
-  development. Today the only way to follow a dog is polling
-  `account_map()`, which the app itself does every 16 seconds; the socket pushes
-  position roughly every 5 seconds instead.
-
-  The apps use Azure SignalR Service's redirect handshake:
-
-  1. `POST https://halo-prod-sockets-app.azurewebsites.net/{TelemetryHub,NotificationHub}/negotiate?negotiateVersion=1`
-     with the normal Halo bearer token. The response carries a
-     `halo-prod-signalr.service.signalr.net` URL plus a separate short-lived
-     `accessToken` for that service.
-  2. `POST` that URL's `/negotiate` with the returned token to get a connection id.
-  3. Open the `wss://` URL and send the handshake frame
-     `{"protocol":"json","version":1}` terminated by `0x1e`, which also separates
-     every later frame.
-
-  The connection is receive-only past the handshake — the client never invokes
-  anything — so a consumer only has to dispatch three server methods:
-  `HandleIoTTelemetry` (the frequent one: `collarSerialNumber`, `petId`,
-  `collarTelemetry`, and a `petTelemetry` object with `latitude`, `longitude`,
-  `speed`, `orientation`, `activityType`, `safetyStatus`, `geoFence`, `beacon`,
-  and a `manifest` with `sequenceCode` for ordering), `HandleDataStateChanged`,
-  and `HandleCollarDataSynchronized`.
 
 - **Halo Dog Park.** `app-dogpark-halo-prod.azurewebsites.net` is a separate
   service that takes the same bearer token; `GET /configuration` returns chat and

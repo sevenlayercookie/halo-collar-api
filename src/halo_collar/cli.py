@@ -12,8 +12,10 @@ be silent on stdout and still tell you what it did.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import difflib
 import getpass
+import json
 import sys
 import webbrowser
 from collections import Counter
@@ -48,6 +50,7 @@ from .output import (
     safe_pet_summary,
     safe_profile_summary,
 )
+from .signalr import HaloSignalRClient, SignalREvent, SignalRHub
 from .storage import StateStore
 
 SUPPORT_URL = "https://github.com/sevenlayercookie/halo-collar-api/issues"
@@ -98,7 +101,7 @@ RETIRED_COMMANDS = {
 }
 
 CONCISE_HELP = f"""\
-halo — unofficial client for supported Halo Collar REST endpoints
+halo — unofficial client for the supported Halo Collar API
 
 USAGE
   halo <noun> <verb> [flags]
@@ -108,6 +111,7 @@ EXAMPLES
   halo pet list                     Every pet, including collarless ones
   halo collar list                  Collars, battery, and connectivity
   halo fence list                   Geofences on the account
+  halo live telemetry               Stream unredacted events as JSON Lines
   halo correction send PET_ID Warning
                                     Send one correction, with safety checks
 
@@ -119,6 +123,7 @@ NOUNS
   fence         List and change containment fences
   beacon        List beacons and their ranges
   walk          List recorded walks
+  live          Stream live telemetry and notification events
   notification  Notification history and the in-app inbox
   correction    Send a correction and read the rules behind it
   training      Training course progress
@@ -127,8 +132,8 @@ NOUNS
   video         Onboarding and training video streams
   system        Public configuration and the server clock
 
-Output is JSON with --json, and a table otherwise. Data goes to stdout;
-notices and errors go to stderr.
+Live streams are JSON Lines. Other output is JSON with --json, and a table
+otherwise. Data goes to stdout; notices and errors go to stderr.
 
 Run `halo help` for every command, or `halo <noun> --help`.
 Report problems at {SUPPORT_URL}
@@ -323,7 +328,7 @@ def _points(values: Sequence[str]) -> list[tuple[float, float]]:
 def build_parser() -> argparse.ArgumentParser:
     parser = _HelpfulParser(
         prog="halo",
-        description="Unofficial client for supported Halo Collar REST endpoints.",
+        description="Unofficial client for the supported Halo Collar API.",
         epilog=f"Run `halo help` for a tour.\nReport problems at {SUPPORT_URL}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         parents=[_common_flags()],
@@ -340,6 +345,7 @@ def build_parser() -> argparse.ArgumentParser:
     _build_fence(subparsers)
     _build_beacon(subparsers)
     _build_walk(subparsers)
+    _build_live(subparsers)
     _build_notification(subparsers)
     _build_correction(subparsers)
     _build_training(subparsers)
@@ -739,6 +745,63 @@ def _build_walk(subparsers: Any) -> None:
     listing.add_argument("--page-size", type=int, default=30, help="Rows per page (default: 30).")
 
 
+def _build_live(subparsers: Any) -> None:
+    live = _group(
+        subparsers,
+        "live",
+        help_text="Stream live telemetry and notification events.",
+        description=(
+            "Open Halo's SignalR connection and print one unredacted JSON event per "
+            "line until interrupted. Live telemetry may contain precise location data."
+        ),
+    )
+    telemetry = _leaf(
+        live,
+        "telemetry",
+        help_text="Stream live collar and pet telemetry.",
+        description=(
+            "Stream TelemetryHub as compact JSON Lines until Ctrl-C. Events are "
+            "unredacted and may contain precise pet locations."
+        ),
+        examples=(
+            "  halo live telemetry\n"
+            "  halo live telemetry --pet-id PET_ID\n"
+            "  halo live telemetry --target HandleIoTTelemetry"
+        ),
+        handler=_live_telemetry,
+    )
+    _live_filter_arguments(telemetry)
+
+    notifications = _leaf(
+        live,
+        "notifications",
+        help_text="Stream live notification-hub events.",
+        description=(
+            "Stream NotificationHub as compact JSON Lines until Ctrl-C. This is "
+            "the live socket, not the stored notification history."
+        ),
+        examples=(
+            "  halo live notifications\n"
+            "  halo live notifications --target TARGET"
+        ),
+        handler=_live_notifications,
+    )
+    _live_filter_arguments(notifications)
+
+
+def _live_filter_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--pet-id",
+        help="Only print events whose common petId field matches this value.",
+    )
+    parser.add_argument(
+        "--target",
+        action="append",
+        default=[],
+        help="Only print this SignalR target; repeat to allow several targets.",
+    )
+
+
 def _build_notification(subparsers: Any) -> None:
     notification = _group(
         subparsers,
@@ -977,6 +1040,50 @@ def _build_video(subparsers: Any) -> None:
 
 
 # --- Handlers -------------------------------------------------------------
+
+
+def _live_telemetry(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    return asyncio.run(_stream_live_events(args, client, out, SignalRHub.TELEMETRY))
+
+
+def _live_notifications(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    return asyncio.run(_stream_live_events(args, client, out, SignalRHub.NOTIFICATIONS))
+
+
+async def _stream_live_events(
+    args: argparse.Namespace,
+    client: HaloClient,
+    out: Output,
+    hub: SignalRHub,
+) -> int:
+    targets = set(args.target)
+    async with HaloSignalRClient(client, hub=hub) as stream:
+        await stream.wait_connected()
+        out.note(
+            f"Listening to {hub.value}; press Ctrl-C to stop. "
+            "Events are unredacted and may contain precise location data."
+        )
+        async for event in stream:
+            if not _live_event_matches(event, pet_id=args.pet_id, targets=targets):
+                continue
+            payload = {**event.raw, "hub": event.hub.value}
+            print(
+                json.dumps(payload, separators=(",", ":"), sort_keys=True),
+                file=out.stdout,
+                flush=True,
+            )
+    return EXIT_OK
+
+
+def _live_event_matches(
+    event: SignalREvent,
+    *,
+    pet_id: str | None,
+    targets: set[str],
+) -> bool:
+    if pet_id is not None and event.pet_id != pet_id:
+        return False
+    return not targets or event.target in targets
 
 
 def _auth_login(args: argparse.Namespace, _: HaloClient | None, out: Output) -> int:
