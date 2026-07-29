@@ -18,6 +18,13 @@ from dataclasses import dataclass
 from typing import Any
 
 MISSING = "-"
+NULL = "null"
+
+# A table stops earning its keep once it wraps or runs to hundreds of rows, so
+# past these limits a payload is better read as JSON than as a mangled grid.
+MAX_TABLE_WIDTH = 120
+MAX_TABLE_ROWS = 200
+MAX_COLUMNS = 10
 
 
 @dataclass(frozen=True)
@@ -26,6 +33,131 @@ class Column:
 
     heading: str
     key: str
+
+
+@dataclass(frozen=True)
+class Fields:
+    """A run of scalar keys, rendered as FIELD/VALUE."""
+
+    heading: str | None
+    mapping: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class Rows:
+    """A list of records, rendered as a table."""
+
+    heading: str | None
+    rows: list[dict[str, Any]]
+    columns: list[Column]
+
+
+@dataclass(frozen=True)
+class Document:
+    """A value no table can hold, kept as JSON beside ones that can."""
+
+    heading: str | None
+    value: Any
+
+
+def _is_scalar(value: Any) -> bool:
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def _row_columns(items: list[Any]) -> list[Column] | None:
+    """Columns for a list of records, or None if it is not one worth tabulating."""
+
+    if not items or len(items) > MAX_TABLE_ROWS:
+        return None
+    if not all(isinstance(item, dict) for item in items):
+        return None
+    keys = sorted({key for item in items for key in item})
+    if not keys or len(keys) > MAX_COLUMNS:
+        return None
+    return [Column(key.upper(), key) for key in keys]
+
+
+def _fits(rows: list[dict[str, Any]], columns: list[Column]) -> bool:
+    widths = [
+        max(
+            len(column.heading),
+            *(len(_cell(row.get(column.key), missing=NULL)) for row in rows),
+        )
+        for column in columns
+    ]
+    return sum(widths) + 2 * (len(columns) - 1) <= MAX_TABLE_WIDTH
+
+
+Section = Fields | Rows | Document
+
+
+def _fields_fit(mapping: dict[str, Any]) -> bool:
+    """A field table with a 1500-character cell in it is not a table."""
+
+    return all(len(_cell(item, missing=NULL)) <= MAX_TABLE_WIDTH for item in mapping.values())
+
+
+def auto_sections(value: Any) -> list[Section] | None:
+    """Lay out a payload as tables, or return None to leave it as JSON.
+
+    Shallow things read better as a grid: a run of scalar fields, a list of flat
+    records, a small nested object. Anything deeper or wider than that — one
+    pet, the configuration, a notification row carrying twenty-one columns — is
+    left alone, because a table that wraps is harder to read than the JSON it
+    came from.
+
+    One exception earns its keep: a payload that is mostly metadata around a
+    single oversized collection, like a page of walks, shows the metadata as a
+    table and leaves that one collection as JSON. Two such collections and the
+    result is a JSON document with headings sprinkled in it, so it bails.
+    """
+
+    if isinstance(value, list):
+        columns = _row_columns(value)
+        if columns is None or not _fits(value, columns):
+            return None
+        return [Rows(None, value, columns)]
+    if not isinstance(value, dict) or not value:
+        return None
+
+    sections: list[Section] = []
+    documents = 0
+    run: dict[str, Any] = {}
+
+    def flush() -> None:
+        nonlocal run
+        if run:
+            sections.append(Fields(None, run))
+            run = {}
+
+    # Sorted so the table and `--json`, which also sorts, agree on order.
+    for key, item in sorted(value.items()):
+        if _is_scalar(item) or item == [] or item == {}:
+            run[key] = item
+        elif isinstance(item, dict) and all(_is_scalar(inner) for inner in item.values()):
+            if not _fields_fit(item):
+                return None
+            flush()
+            sections.append(Fields(key.upper(), item))
+        elif isinstance(item, list):
+            columns = _row_columns(item)
+            if columns is not None and _fits(item, columns):
+                flush()
+                sections.append(Rows(key.upper(), item, columns))
+                continue
+            documents += 1
+            if documents > 1:
+                return None
+            flush()
+            sections.append(Document(key.upper(), item))
+        else:
+            return None
+    if not _fields_fit(run):
+        return None
+    flush()
+    if not sections or all(isinstance(section, Document) for section in sections):
+        return None
+    return sections
 
 
 @dataclass
@@ -73,15 +205,51 @@ class Output:
         no sensible flat view passes neither and prints JSON to everyone.
         """
 
-        if self.as_json or (rows is None and pairs is None):
+        if self.as_json:
             self.json(data)
+        elif _is_scalar(data):
+            # A bare timestamp or count reads better without JSON's quotes.
+            self.text(_cell(data, missing=NULL))
         elif pairs is not None:
-            self._pairs(pairs)
+            self._sections([Fields(None, pairs)])
+        elif rows is not None:
+            self._table(rows, columns or [])
         else:
-            self._table(rows or [], columns or [])
+            # Nothing curated: work out whether the payload is shallow enough to
+            # tabulate on its own, and leave it as JSON when it is not.
+            sections = auto_sections(data)
+            if sections is None:
+                self.json(data)
+            else:
+                self._sections(sections)
 
-    def _table(self, rows: list[dict[str, Any]], columns: list[Column]) -> None:
-        cells = [[_cell(row.get(column.key)) for column in columns] for row in rows]
+    def _sections(self, sections: list[Section]) -> None:
+        for index, section in enumerate(sections):
+            if index:
+                print("", file=self.stdout)
+            if section.heading and not self.plain:
+                print(section.heading, file=self.stdout)
+            if isinstance(section, Document):
+                self.json(section.value)
+            elif isinstance(section, Rows):
+                self._table(section.rows, section.columns, missing=NULL)
+            else:
+                self._table(
+                    [{"field": key, "value": item} for key, item in section.mapping.items()],
+                    [Column("FIELD", "field"), Column("VALUE", "value")],
+                    missing=NULL,
+                )
+
+    def _table(
+        self,
+        rows: list[dict[str, Any]],
+        columns: list[Column],
+        *,
+        missing: str = MISSING,
+    ) -> None:
+        cells = [
+            [_cell(row.get(column.key), missing=missing) for column in columns] for row in rows
+        ]
         if self.plain:
             for line in cells:
                 print("\t".join(line), file=self.stdout)
@@ -102,21 +270,23 @@ class Output:
             row = "  ".join(c.ljust(w) for c, w in zip(line, widths, strict=True))
             print(row.rstrip(), file=self.stdout)
 
-    def _pairs(self, value: dict[str, Any]) -> None:
-        if self.plain:
-            for key, item in value.items():
-                print(f"{key}\t{_cell(item)}", file=self.stdout)
-            return
-        width = max((len(key) for key in value), default=0)
-        for key, item in value.items():
-            print(f"{key.ljust(width)}  {_cell(item)}", file=self.stdout)
 
+def _cell(value: Any, *, missing: str = MISSING) -> str:
+    """Render one value.
 
-def _cell(value: Any) -> str:
-    if value is None or value == "":
+    Booleans and nulls print as Halo sent them rather than as English, because
+    this is a view of an API and `true` is what the field actually says. The
+    ``missing`` placeholder differs by caller: a curated column showing a dash
+    means "nothing to show here", while `null` in a field table means Halo
+    returned null.
+    """
+
+    if value is None:
+        return missing
+    if value == "":
         return MISSING
     if isinstance(value, bool):
-        return "yes" if value else "no"
+        return "true" if value else "false"
     if isinstance(value, (dict, list)):
         return json.dumps(value, sort_keys=True)
     return str(value)

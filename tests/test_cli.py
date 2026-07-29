@@ -187,13 +187,83 @@ def test_table_output_aligns_and_plain_output_is_tab_separated(capsys) -> None:
     assert json.loads(capsys.readouterr().out) == rows
 
 
-def test_booleans_read_as_words_in_a_table(capsys) -> None:
+def test_booleans_print_as_the_api_spells_them(capsys) -> None:
     rows = [{"online": True, "enabled": False}]
     Output().emit(
         rows, rows=rows, columns=[cli.Column("ONLINE", "online"), cli.Column("ENABLED", "enabled")]
     )
 
-    assert capsys.readouterr().out.splitlines()[1].split() == ["yes", "no"]
+    assert capsys.readouterr().out.splitlines()[1].split() == ["true", "false"]
+
+
+def test_a_shallow_object_becomes_field_tables_around_its_lists(capsys) -> None:
+    Output().emit(
+        {
+            "accessLevel": "basic",
+            "maxCollarsCount": 1,
+            "temporaryPrivileges": None,
+            "features": [
+                {"id": "findcollar", "isEnabled": True},
+                {"id": "deleteaccount", "isEnabled": False},
+            ],
+        }
+    )
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].split() == ["FIELD", "VALUE"]
+    assert lines[1].split() == ["accessLevel", "basic"]
+    # Sorted, so the run splits either side of the list exactly as --json orders it.
+    assert "FEATURES" in lines
+    features = lines.index("FEATURES")
+    assert lines[features + 1].split() == ["ID", "ISENABLED"]
+    assert lines[features + 2].split() == ["findcollar", "true"]
+    # A null Halo actually sent reads as null, not as an absent-value dash.
+    assert ["temporaryPrivileges", "null"] in [line.split() for line in lines]
+
+
+def test_a_scalar_prints_bare_rather_than_quoted(capsys) -> None:
+    Output().emit("2026-07-29T18:25:25+00:00")
+
+    assert capsys.readouterr().out.strip() == "2026-07-29T18:25:25+00:00"
+
+
+def test_a_deep_payload_stays_json(capsys) -> None:
+    payload = {"collarInfo": {"telemetry": {"wiFi": {"status": "socketconnected"}}}, "id": "pet-1"}
+    Output().emit(payload)
+
+    assert json.loads(capsys.readouterr().out) == payload
+
+
+def test_a_wide_row_stays_json_rather_than_wrapping(capsys) -> None:
+    payload = {"results": [{f"column{index}": "x" * 20 for index in range(9)}]}
+    Output().emit(payload)
+
+    assert json.loads(capsys.readouterr().out) == payload
+
+
+def test_an_enormous_field_value_stays_json(capsys) -> None:
+    payload = {"status": 200, "body": "x" * 1500}
+    Output().emit(payload)
+
+    assert json.loads(capsys.readouterr().out) == payload
+
+
+def test_one_oversized_collection_still_lets_its_metadata_tabulate(capsys) -> None:
+    rows = [{f"column{index}": "x" * 20 for index in range(9)}]
+    Output().emit({"pageNumber": 1, "pageSize": 2, "results": rows})
+
+    out = capsys.readouterr().out
+    assert "pageNumber" in out.splitlines()[1]
+    assert "RESULTS" in out
+    assert json.loads(out[out.index("RESULTS") + len("RESULTS") :]) == rows
+
+
+def test_two_oversized_collections_are_left_alone(capsys) -> None:
+    wide = [{f"column{index}": "x" * 20 for index in range(9)}]
+    payload = {"pageNumber": 1, "results": wide, "others": wide}
+    Output().emit(payload)
+
+    assert json.loads(capsys.readouterr().out) == payload
 
 
 def test_quiet_silences_notices_but_never_data(capsys) -> None:
@@ -203,7 +273,7 @@ def test_quiet_silences_notices_but_never_data(capsys) -> None:
 
     captured = capsys.readouterr()
     assert captured.err == ""
-    assert json.loads(captured.out) == {"kept": True}
+    assert "kept" in captured.out and "true" in captured.out
 
 
 def test_pet_summary_hides_coordinates_and_report_urls() -> None:
