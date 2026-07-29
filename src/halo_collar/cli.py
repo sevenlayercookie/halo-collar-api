@@ -81,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("configuration", help="Fetch public Halo configuration.")
     subparsers.add_parser("collars", help="List collars on the account.")
 
-    subparsers.add_parser("pets", help="List pets with their collar information.")
+    subparsers.add_parser("pets", help="List every pet, including pets with no collar.")
 
     pet = subparsers.add_parser("pet", help="Fetch one pet.")
     pet.add_argument("pet_id")
@@ -180,7 +180,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             elif args.command == "collars":
                 _print_json(_safe_collar_summary(client.collars()))
             elif args.command == "pets":
-                _print_json(client.pets())
+                _print_json(_safe_pet_summary(client.pets()))
             elif args.command == "pet":
                 _print_json(client.pet(args.pet_id, refresh_telemetry=args.refresh_telemetry))
             elif args.command == "map":
@@ -404,6 +404,30 @@ def _safe_collar_summary(collars: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     telemetry.get("batteryChargePercent") if isinstance(telemetry, dict) else None
                 ),
                 "online": HaloClient.collar_is_online(collar),
+            }
+        )
+    return result
+
+
+def _safe_pet_summary(pets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Avoid dumping live coordinates and signed report URLs by default."""
+
+    result = []
+    for pet in pets:
+        collar = pet.get("collarInfo")
+        result.append(
+            {
+                "id": pet.get("id"),
+                "name": pet.get("name"),
+                "breed": pet.get("breed"),
+                "collar": (
+                    {"id": collar.get("id"), "serialNumber": collar.get("serialNumber")}
+                    if isinstance(collar, dict)
+                    else None
+                ),
+                "isCollarEverAssigned": pet.get("isCollarEverAssigned"),
+                "fencesState": pet.get("fencesState"),
+                "beaconsState": pet.get("beaconsState"),
             }
         )
     return result

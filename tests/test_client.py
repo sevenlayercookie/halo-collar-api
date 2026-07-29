@@ -471,6 +471,23 @@ def test_pets_requires_a_list_of_objects(tmp_path) -> None:
         client.pets()
 
 
+def test_pets_lists_pets_that_have_no_collar(tmp_path) -> None:
+    # /collar/my/ only reaches pets with a collar bound, so this endpoint is the
+    # only way to see a pet whose collarInfo is still null.
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/pet/my"
+        return httpx.Response(
+            200,
+            json=[
+                {"id": "pet-1", "name": "Alpha", "collarInfo": None},
+                {"id": "pet-2", "name": "Bravo", "collarInfo": {"id": "collar-1"}},
+            ],
+        )
+
+    client = _stub_client(tmp_path, handler)
+    assert [pet["name"] for pet in client.pets()] == ["Alpha", "Bravo"]
+
+
 def test_geo_fence_add_matches_the_captured_body(tmp_path) -> None:
     requests: list[httpx.Request] = []
 

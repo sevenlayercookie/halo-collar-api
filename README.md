@@ -10,7 +10,8 @@ Implemented, supported functionality:
 - Refresh-token login and automatic access-token refresh/rotation
 - Public application configuration
 - Account collars and connectivity
-- Pet listing, details, creation, editing, and optional telemetry refresh
+- Pet listing (including collarless pets), details, creation, editing, and
+  optional telemetry refresh
 - The aggregate map view, geofence create/rename/move/delete, and safe-zone preview
 - User profile, beacons, subscription, and in-app notifications
 - Walk history, notification history, and marking notifications read
@@ -148,8 +149,10 @@ halo walks --page 1 --page-size 30
 halo notifications --page 1 --page-size 30
 ```
 
-`halo collars` prints a privacy-reduced summary rather than full Wi-Fi and
-telemetry data.
+`halo collars` and `halo pets` print privacy-reduced summaries rather than full
+Wi-Fi, coordinate, and signed-report-URL data. `halo pets` reaches every pet on
+the account, including ones that have never had a collar assigned and so never
+appear in `halo collars`. Use `halo pet PET_ID` for the full object.
 
 `halo map` calls `/account/my/map`, which the app polls on its home screen. One
 response returns `pets` (each with its collar embedded), `geoFencesInfo`, and
