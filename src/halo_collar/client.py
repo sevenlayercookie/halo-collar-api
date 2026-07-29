@@ -183,8 +183,8 @@ class HaloClient:
 
     def account_map(
         self,
-        latitude: float,
-        longitude: float,
+        latitude: float | None = None,
+        longitude: float | None = None,
         *,
         refresh_telemetry: bool = False,
         max_corrections_count: int = 20,
@@ -193,20 +193,32 @@ class HaloClient:
 
         One response returns ``pets`` (each with its collar embedded),
         ``geoFencesInfo``, and ``corrections``, so prefer this over several
-        separate calls when polling.
+        separate calls when polling. The apps always send a viewport centre, but
+        Halo returns the whole account without one, so callers that only want
+        fences or pets may omit the coordinates.
         """
 
-        return self._get_object(
-            "/account/my/map",
-            params={
-                "viewport.center.latitude": str(float(latitude)),
-                "viewport.center.longitude": str(float(longitude)),
-                "RefreshTelemetry": str(refresh_telemetry),
-                "MaxCorrectionsCount": str(
-                    _positive(max_corrections_count, "max_corrections_count")
-                ),
-            },
-        )
+        if (latitude is None) != (longitude is None):
+            raise ValueError("Pass both latitude and longitude, or neither.")
+        params = {
+            "RefreshTelemetry": str(refresh_telemetry),
+            "MaxCorrectionsCount": str(_positive(max_corrections_count, "max_corrections_count")),
+        }
+        if latitude is not None and longitude is not None:
+            params["viewport.center.latitude"] = str(float(latitude))
+            params["viewport.center.longitude"] = str(float(longitude))
+        return self._get_object("/account/my/map", params=params)
+
+    def geofences(self) -> list[dict[str, Any]]:
+        """List the account's geofences, which Halo returns only on the map payload."""
+
+        info = self.account_map().get("geoFencesInfo")
+        if not isinstance(info, dict):
+            raise HaloAPIError("Halo returned an unexpected geofence container.")
+        value = info.get("geoFencesToDisplay")
+        if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+            raise HaloAPIError("Halo returned an unexpected geofence list.")
+        return value
 
     def walks(self, *, page: int = 1, page_size: int = 30) -> dict[str, Any]:
         """Fetch one page of recorded walks."""
