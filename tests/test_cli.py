@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import json
+
+import pytest
 
 from halo_collar import ANDROID_CLIENT_SECRET, TokenSet, cli
 
@@ -169,6 +172,135 @@ def test_map_summary_redacts_pets_and_fences_and_counts_corrections() -> None:
     rendered = json.dumps(summary)
     for secret in ("40.0001", "SECRETSIG", "Springfield"):
         assert secret not in rendered
+
+
+def test_profile_summary_hides_email_avatar_and_referral_link() -> None:
+    summary = cli._safe_profile_summary(
+        {
+            "id": "user-1",
+            "userId": "auth-1",
+            "firstName": "Pat",
+            "lastName": "Quinn",
+            "email": "person@example.com",
+            "currentEmail": "person@example.com",
+            "updatedEmail": "new@example.com",
+            "iconUrl": "https://haloprodst.blob.core.windows.net/avatar.png?sig=SECRETSIG",
+            "hasChangeEmailRequest": False,
+            "onboardingProgressState": "finished",
+            "referralCoupon": {
+                "amount": 20,
+                "canShare": True,
+                "referralLink": "https://halo.example/r/SECRETCODE",
+            },
+        }
+    )
+
+    assert summary["firstName"] == "Pat"
+    assert summary["referralCoupon"] == {"amount": 20, "canShare": True}
+    rendered = json.dumps(summary)
+    for secret in ("example.com", "SECRETSIG", "SECRETCODE", "blob.core.windows.net"):
+        assert secret not in rendered
+
+
+def test_points_require_three_pairs() -> None:
+    assert cli._points(["40.0,-75.0", "40.1,-75.1", "40.2,-75.2"]) == [
+        (40.0, -75.0),
+        (40.1, -75.1),
+        (40.2, -75.2),
+    ]
+    for bad in (["40.0,-75.0", "40.1,-75.1"], ["40.0"], ["40.0,-75.0,1", "a,b", "40.2,-75.2"]):
+        with pytest.raises(ValueError):
+            cli._points(bad)
+
+
+def test_pet_update_keeps_unspecified_fields(monkeypatch, capsys) -> None:
+    sent: dict[str, object] = {}
+
+    class FakeClient:
+        def pet(self, pet_id):
+            assert pet_id == "pet-1"
+            return {
+                "name": "Alpha",
+                "colorHex": "#ff0000",
+                "breed": "goldenretriever",
+                "birthday": "2021-04-17T00:00:00Z",
+                "weightKg": 28.5,
+            }
+
+        def update_pet(self, pet_id, **fields):
+            sent.update(fields, pet_id=pet_id)
+            return {"id": pet_id, **fields}
+
+    args = argparse.Namespace(
+        pet_id="pet-1",
+        name=None,
+        color_hex=None,
+        breed=None,
+        birthday=None,
+        weight_kg=31.0,
+    )
+
+    assert cli._update_pet(args, FakeClient()) == 0
+    assert sent == {
+        "pet_id": "pet-1",
+        "name": "Alpha",
+        "color_hex": "#ff0000",
+        "breed": "goldenretriever",
+        "birthday": "2021-04-17T00:00:00Z",
+        "weight_kg": 31.0,
+    }
+    assert "Alpha" in capsys.readouterr().out
+
+
+def test_pet_update_refuses_to_blank_a_field_halo_requires() -> None:
+    class FakeClient:
+        def pet(self, pet_id):
+            return {"name": "Alpha", "colorHex": "#ff0000", "breed": None, "weightKg": 28.5}
+
+    args = argparse.Namespace(
+        pet_id="pet-1",
+        name=None,
+        color_hex=None,
+        breed=None,
+        birthday=None,
+        weight_kg=None,
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        cli._update_pet(args, FakeClient())
+    assert "birthday" in str(excinfo.value)
+    assert "breed" in str(excinfo.value)
+
+
+def test_fence_mutations_cancel_unless_the_identifier_is_typed(monkeypatch, capsys) -> None:
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        def add_geo_fence(self, name, points):
+            self.calls += 1
+            return {"id": "fence-1"}
+
+        def update_geo_fence_location(self, fence_id, points):
+            self.calls += 1
+            return {"id": fence_id}
+
+    points = ["40.0,-75.0", "40.1,-75.1", "40.2,-75.2"]
+    add_args = argparse.Namespace(name="Back yard", point=points, yes=False)
+    move_args = argparse.Namespace(fence_id="fence-1", point=points, yes=False)
+
+    monkeypatch.setattr("builtins.input", lambda _: "not the name")
+    client = FakeClient()
+    assert cli._add_fence(add_args, client) == 1
+    assert cli._move_fence(move_args, client) == 1
+    assert client.calls == 0
+    assert "no fence was created" in capsys.readouterr().out
+
+    monkeypatch.setattr("builtins.input", lambda _: "Back yard")
+    assert cli._add_fence(add_args, client) == 0
+    monkeypatch.setattr("builtins.input", lambda _: "fence-1")
+    assert cli._move_fence(move_args, client) == 0
+    assert client.calls == 2
 
 
 def test_map_summary_tolerates_missing_sections() -> None:
