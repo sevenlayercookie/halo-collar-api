@@ -286,7 +286,7 @@ def test_fence_mutations_cancel_unless_the_identifier_is_typed(monkeypatch, caps
             return {"id": fence_id}
 
     points = ["40.0,-75.0", "40.1,-75.1", "40.2,-75.2"]
-    add_args = argparse.Namespace(name="Back yard", point=points, yes=False)
+    add_args = argparse.Namespace(name="Back yard", point=points, yes=False, full=False)
     move_args = argparse.Namespace(fence_id="fence-1", point=points, yes=False)
 
     monkeypatch.setattr("builtins.input", lambda _: "not the name")
@@ -301,6 +301,64 @@ def test_fence_mutations_cancel_unless_the_identifier_is_typed(monkeypatch, caps
     monkeypatch.setattr("builtins.input", lambda _: "fence-1")
     assert cli._move_fence(move_args, client) == 0
     assert client.calls == 2
+
+
+def test_fence_add_summarizes_the_nested_fence_halo_returns(capsys) -> None:
+    class FakeClient:
+        def add_geo_fence(self, name, points):
+            return {
+                "geoFence": {
+                    "id": "fence-1",
+                    "name": name,
+                    "isEnabled": True,
+                    "thumbnailUrl": "https://haloprodst.blob.core.windows.net/f.png?sig=SECRETSIG",
+                    "zones": [
+                        {"type": "safe", "locationPoints": [{"latitude": 40.0, "longitude": -75.0}]}
+                    ],
+                }
+            }
+
+    args = argparse.Namespace(
+        name="Back yard",
+        point=["40.0,-75.0", "40.1,-75.1", "40.2,-75.2"],
+        yes=True,
+        full=False,
+    )
+
+    assert cli._add_fence(args, FakeClient()) == 0
+    out = capsys.readouterr().out
+    assert '"id": "fence-1"' in out
+    assert "SECRETSIG" not in out
+    assert '"pointCount": 1' in out
+
+    args.full = True
+    assert cli._add_fence(args, FakeClient()) == 0
+    assert "SECRETSIG" in capsys.readouterr().out
+
+
+def test_pet_delete_cancels_unless_the_name_is_typed(monkeypatch, capsys) -> None:
+    class FakeClient:
+        def __init__(self):
+            self.deleted: list[str] = []
+
+        def pet(self, pet_id):
+            return {"id": pet_id, "name": "Alpha"}
+
+        def delete_pet(self, pet_id):
+            self.deleted.append(pet_id)
+
+    args = argparse.Namespace(pet_id="pet-1", yes=False)
+    client = FakeClient()
+
+    monkeypatch.setattr("builtins.input", lambda _: "wrong")
+    assert cli._delete_pet(args, client) == 1
+    assert client.deleted == []
+    assert "was not deleted" in capsys.readouterr().out
+
+    monkeypatch.setattr("builtins.input", lambda _: "Alpha")
+    assert cli._delete_pet(args, client) == 0
+    assert client.deleted == ["pet-1"]
+    assert "Deleted Alpha" in capsys.readouterr().out
 
 
 def test_map_summary_tolerates_missing_sections() -> None:

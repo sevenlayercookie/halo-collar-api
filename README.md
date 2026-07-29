@@ -226,6 +226,7 @@ Supported upstream routes:
 | POST | `/pet/{id}/run-instant-correction/` | `send_instant_correction()` |
 | POST | `/pet/add` | `add_pet()` |
 | PUT | `/pet/{id}` | `update_pet()` |
+| DELETE | `/pet/{id}` | `delete_pet()` |
 | PUT | `/pet/check-name-uniqueness` | `pet_name_is_available()` |
 | PUT | `/notification/status` | `set_notification_status()` |
 | POST | `/geo-fence/safe-zones` | `geo_fence_safe_zones()` |
@@ -245,6 +246,21 @@ others do not. `/walk/my` pages with `page`/`pageSize` while
 `/notification/my/query` pages with `Page`/`PageSize`; that inconsistency is
 Halo's, not a typo.
 
+### Parallel-call version
+
+Every response carries a `Halo-ParallelCall-Version` header that Halo increments
+as account state changes, and it rejects a write carrying a stale one with HTTP
+400 `errorCode 3001`, "Parallel call version is obsolete". A fresh client has
+never seen a response and so starts with a placeholder, which means a session
+whose *first* request is a write would always fail. Before its first write the
+client reads `/system/server-date-time` to be told the current value, then sends
+the write carrying it. Corrections already read the clock for their expiry, so
+this costs them nothing and no write is ever sent twice.
+
+`add_geo_fence` returns the new fence nested under `geoFence` rather than at the
+top level, while `update_geo_fence_location` answers `{"status": "success"}` and
+returns no geometry.
+
 ### Pets
 
 Halo replaces a pet's profile wholesale rather than patching it, so `update_pet`
@@ -257,11 +273,16 @@ halo pet-colors                      # colorHex must come from this list
 halo pet-add --name Scout --color-hex "#FF7A00" --breed goldenretriever \
     --birthday 2021-04-17 --weight-kg 28.5
 halo pet-update PET_ID --weight-kg 29.2
+halo pet-delete PET_ID
 ```
 
 Saving marks the collar's configuration `outdated` until it next syncs. A new
 pet has no collar until one is bound, so it appears in `halo pets` but not in
 `halo collars`.
+
+`delete_pet()` removes the pet and the history Halo keeps under it. Halo answers
+200 with an empty body rather than returning what it deleted, so nothing here
+undoes it; `halo pet-delete` asks you to type the pet's name first.
 
 ### Fences
 

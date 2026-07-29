@@ -90,7 +90,13 @@ def test_old_command_reconciles_without_retry(tmp_path) -> None:
         nonlocal calls
         calls += 1
         if request.url.path == "/system/server-date-time":
-            return httpx.Response(200, json={"serverDateTime": "2026-07-26T20:00:00Z"})
+            # Halo reports the parallel-call version on every response, so the
+            # correction's own clock read is what warms it; no extra call.
+            return httpx.Response(
+                200,
+                json={"serverDateTime": "2026-07-26T20:00:00Z"},
+                headers={"Halo-ParallelCall-Version": "27"},
+            )
         return httpx.Response(
             409,
             json={"result": "oldcommandnumber", "currentCommandNumber": 20},
@@ -123,7 +129,11 @@ def test_transport_error_has_unknown_outcome_and_reserved_counter(tmp_path) -> N
         nonlocal calls
         calls += 1
         if request.url.path == "/system/server-date-time":
-            return httpx.Response(200, json="2026-07-26T20:00:00Z")
+            return httpx.Response(
+                200,
+                json="2026-07-26T20:00:00Z",
+                headers={"Halo-ParallelCall-Version": "27"},
+            )
         raise httpx.ReadTimeout("timed out", request=request)
 
     store = StateStore(tmp_path / "state.json")
@@ -338,6 +348,8 @@ def test_post_401_refreshes_and_retries_only_once(tmp_path) -> None:
         http=httpx.Client(transport=httpx.MockTransport(handler)),
         auth_base_url="https://auth.example",
     )
+    # This is about the 401 retry, not the warm-up read a cold client makes.
+    client._parallel_call_version = "27"
     response = client._request("POST", "/example", json_body={"value": 1})
     assert response.json() == {"ok": True}
     assert [request.url.path for request in requests] == [
@@ -371,8 +383,21 @@ def test_invalid_refresh_clears_only_tokens(tmp_path) -> None:
     assert store.auth_profile()["client_id"] == "halo.app.android"
 
 
-def _stub_client(tmp_path, handler, *, store: StateStore | None = None) -> HaloClient:
-    return HaloClient(
+def _stub_client(
+    tmp_path,
+    handler,
+    *,
+    store: StateStore | None = None,
+    parallel_call_version: str = "27",
+) -> HaloClient:
+    """Build a client on a mock transport.
+
+    The parallel-call version defaults to a warm one so that tests about request
+    bodies see only their own request; a real client starts cold and reads the
+    clock before its first write. Pass ``"0"`` to exercise that.
+    """
+
+    client = HaloClient(
         client_secret="secret",
         tokens=tokens(),
         store=store or StateStore(tmp_path / "state.json"),
@@ -380,6 +405,8 @@ def _stub_client(tmp_path, handler, *, store: StateStore | None = None) -> HaloC
         amplitude_session_id="1700000000000",
         http=httpx.Client(transport=httpx.MockTransport(handler)),
     )
+    client._parallel_call_version = parallel_call_version
+    return client
 
 
 def test_account_map_sends_the_captured_viewport_parameters(tmp_path) -> None:
@@ -435,13 +462,7 @@ def test_registering_a_device_stores_the_mobile_id_corrections_carry(tmp_path) -
         return httpx.Response(200, json={"mobileId": 3})
 
     store = StateStore(tmp_path / "state.json")
-    client = HaloClient(
-        client_secret="secret",
-        tokens=tokens(),
-        store=store,
-        app_instance_id="app-instance",
-        http=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+    client = _stub_client(tmp_path, handler, store=store)
 
     assert client.mobile_id == 2
     assert client.register_mobile_device() == 3
@@ -478,6 +499,48 @@ def test_registration_rejects_a_mobile_id_that_is_not_an_integer(tmp_path) -> No
 
     with pytest.raises(HaloAPIError):
         client.register_mobile_device()
+
+
+def test_a_mutation_learns_the_parallel_call_version_before_writing(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/system/server-date-time":
+            return httpx.Response(
+                200,
+                json="2026-07-29T12:00:00Z",
+                headers={"Halo-ParallelCall-Version": "27"},
+            )
+        return httpx.Response(200, json={"id": "pet-1"})
+
+    client = _stub_client(tmp_path, handler, parallel_call_version="0")
+    client.delete_pet("pet-1")
+
+    # Halo rejects a write carrying the placeholder version, so the clock is
+    # read first and the write carries what it reported.
+    assert [request.url.path for request in requests] == [
+        "/system/server-date-time",
+        "/pet/pet-1",
+    ]
+    assert requests[0].headers["Halo-ParallelCall-Version"] == "0"
+    assert requests[1].headers["Halo-ParallelCall-Version"] == "27"
+    assert requests[1].method == "DELETE"
+
+
+def test_a_known_parallel_call_version_is_not_re_fetched(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=[], headers={"Halo-ParallelCall-Version": "31"})
+
+    client = _stub_client(tmp_path, handler, parallel_call_version="0")
+    client.pets()
+    client.delete_pet("pet-1")
+
+    assert [request.url.path for request in requests] == ["/pet/my", "/pet/pet-1"]
+    assert requests[1].headers["Halo-ParallelCall-Version"] == "31"
 
 
 def test_account_map_rejects_half_a_viewport(tmp_path) -> None:
