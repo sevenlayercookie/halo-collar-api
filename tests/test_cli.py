@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 
 import pytest
 
-from halo_collar import ANDROID_CLIENT_SECRET, TokenSet, cli
+from halo_collar import (
+    ANDROID_CLIENT_SECRET,
+    SignalREvent,
+    SignalRHub,
+    TokenSet,
+    cli,
+)
 from halo_collar.output import Output
 
 
@@ -110,6 +117,161 @@ def test_help_reaches_every_level(capsys) -> None:
     out = capsys.readouterr().out
     assert "--color-hex" in out
     assert "EXAMPLES" in out
+
+
+@pytest.mark.parametrize(
+    ("verb", "hub"),
+    [
+        ("telemetry", SignalRHub.TELEMETRY),
+        ("notifications", SignalRHub.NOTIFICATIONS),
+    ],
+)
+def test_live_commands_emit_json_lines_and_close_the_stream(
+    verb,
+    hub,
+    monkeypatch,
+    capsys,
+) -> None:
+    streams = []
+
+    class FakeClient:
+        def __init__(self, **_):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+    class FakeSignalRClient:
+        def __init__(self, client, *, hub):
+            self.hub = hub
+            self.connected = False
+            self.closed = False
+            self.events = [
+                SignalREvent(
+                    hub=hub,
+                    target="HandleIoTTelemetry",
+                    arguments=[{"petId": "pet-1", "latitude": 40.0}],
+                    raw={
+                        "type": 1,
+                        "target": "HandleIoTTelemetry",
+                        "arguments": [{"petId": "pet-1", "latitude": 40.0}],
+                    },
+                )
+            ]
+            streams.append(self)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            self.closed = True
+
+        async def wait_connected(self):
+            self.connected = True
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self.events:
+                raise StopAsyncIteration
+            return self.events.pop(0)
+
+    monkeypatch.setattr(cli, "HaloClient", FakeClient)
+    monkeypatch.setattr(cli, "HaloSignalRClient", FakeSignalRClient)
+
+    assert cli.main(["live", verb]) == cli.EXIT_OK
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {
+        "hub": hub.value,
+        "type": 1,
+        "target": "HandleIoTTelemetry",
+        "arguments": [{"petId": "pet-1", "latitude": 40.0}],
+    }
+    assert captured.out.count("\n") == 1
+    assert "precise location data" in captured.err
+    assert streams[0].connected is True
+    assert streams[0].closed is True
+
+
+def test_live_filters_accept_one_pet_and_multiple_targets() -> None:
+    parsed = cli.build_parser().parse_args(
+        [
+            "live",
+            "telemetry",
+            "--pet-id",
+            "pet-1",
+            "--target",
+            "HandleIoTTelemetry",
+            "--target",
+            "HandleDataStateChanged",
+        ]
+    )
+    event = SignalREvent(
+        hub=SignalRHub.TELEMETRY,
+        target="HandleIoTTelemetry",
+        arguments=[{"petId": "pet-1"}],
+        raw={},
+    )
+
+    assert parsed.pet_id == "pet-1"
+    assert parsed.target == ["HandleIoTTelemetry", "HandleDataStateChanged"]
+    assert cli._live_event_matches(
+        event,
+        pet_id=parsed.pet_id,
+        targets=set(parsed.target),
+    )
+    assert not cli._live_event_matches(event, pet_id="pet-2", targets=set())
+    assert not cli._live_event_matches(event, pet_id=None, targets={"OtherTarget"})
+
+
+def test_cancelling_live_stream_closes_signalr(monkeypatch) -> None:
+    entered = asyncio.Event()
+    closed = False
+
+    class FakeSignalRClient:
+        def __init__(self, client, *, hub):
+            pass
+
+        async def __aenter__(self):
+            entered.set()
+            return self
+
+        async def __aexit__(self, *_):
+            nonlocal closed
+            closed = True
+
+        async def wait_connected(self):
+            pass
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.Event().wait()
+            raise StopAsyncIteration
+
+    async def scenario() -> None:
+        monkeypatch.setattr(cli, "HaloSignalRClient", FakeSignalRClient)
+        task = asyncio.create_task(
+            cli._stream_live_events(
+                args(pet_id=None, target=[]),
+                object(),
+                Output(),
+                SignalRHub.TELEMETRY,
+            )
+        )
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert closed is True
 
 
 def test_every_leaf_command_documents_itself() -> None:
