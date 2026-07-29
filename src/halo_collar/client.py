@@ -33,6 +33,8 @@ from .storage import StateStore
 
 API_BASE_URL = "https://api.halocollar.com"
 DEFAULT_MOBILE_ID = 2
+_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_UNKNOWN_PARALLEL_CALL_VERSION = "0"
 
 
 class HaloClient:
@@ -100,7 +102,7 @@ class HaloClient:
             self.mobile_id = DEFAULT_MOBILE_ID
         self.api_base_url = api_base_url.rstrip("/")
         self.auth_base_url = auth_base_url
-        self._parallel_call_version = "0"
+        self._parallel_call_version = _UNKNOWN_PARALLEL_CALL_VERSION
         self._owns_http = http is None
         self.http = http or build_http_client()
         if (
@@ -459,6 +461,15 @@ class HaloClient:
             json_body=_pet_body(name, color_hex, breed, birthday, weight_kg),
         )
 
+    def delete_pet(self, pet_id: str) -> None:
+        """Delete a pet and everything Halo keeps under it.
+
+        Halo answers 200 with an empty body rather than returning the pet, so
+        its history is not recoverable from here. Confirm with the owner first.
+        """
+
+        self._request("DELETE", f"/pet/{_identifier(pet_id)}")
+
     def geo_fence_safe_zones(
         self,
         location_points: Sequence[tuple[float, float]],
@@ -770,6 +781,21 @@ class HaloClient:
             raise HaloAPIError(f"Halo returned an unexpected response for {path}.")
         return value
 
+    def _ensure_parallel_call_version(self) -> None:
+        """Learn Halo's current parallel-call version before mutating anything.
+
+        Halo increments this as account state changes and rejects a mutation
+        carrying a stale one with HTTP 400 ``errorCode 3001``, so a client whose
+        first request is a write would always fail. Reading the clock is the
+        cheapest way to be told the current value. The rejection happens before
+        Halo acts, but this preflight avoids relying on that: no write is sent
+        twice.
+        """
+
+        if self._parallel_call_version != _UNKNOWN_PARALLEL_CALL_VERSION:
+            return
+        self._request("GET", "/system/server-date-time", raise_for_status=False)
+
     def _request_json(self, method: str, path: str, **kwargs: Any) -> Any:
         return self._decode_json(self._request(method, path, **kwargs))
 
@@ -788,6 +814,8 @@ class HaloClient:
         method = method.upper()
         if authenticated:
             self.refresh_login()
+            if method in _MUTATING_METHODS:
+                self._ensure_parallel_call_version()
         headers = {
             "Halo-Client": self.halo_client_header,
             "Halo-ParallelCall-Version": self._parallel_call_version,
