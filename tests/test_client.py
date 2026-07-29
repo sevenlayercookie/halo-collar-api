@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from urllib.parse import parse_qs
 
@@ -370,11 +371,11 @@ def test_invalid_refresh_clears_only_tokens(tmp_path) -> None:
     assert store.auth_profile()["client_id"] == "halo.app.android"
 
 
-def _stub_client(tmp_path, handler) -> HaloClient:
+def _stub_client(tmp_path, handler, *, store: StateStore | None = None) -> HaloClient:
     return HaloClient(
         client_secret="secret",
         tokens=tokens(),
-        store=StateStore(tmp_path / "state.json"),
+        store=store or StateStore(tmp_path / "state.json"),
         app_instance_id="app-instance",
         amplitude_session_id="1700000000000",
         http=httpx.Client(transport=httpx.MockTransport(handler)),
@@ -424,6 +425,59 @@ def test_geofences_read_the_map_without_a_viewport(tmp_path) -> None:
     assert requests[0].url.path == "/account/my/map"
     query = parse_qs(requests[0].url.query.decode())
     assert query == {"RefreshTelemetry": ["False"], "MaxCorrectionsCount": ["20"]}
+
+
+def test_registering_a_device_stores_the_mobile_id_corrections_carry(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"mobileId": 3})
+
+    store = StateStore(tmp_path / "state.json")
+    client = HaloClient(
+        client_secret="secret",
+        tokens=tokens(),
+        store=store,
+        app_instance_id="app-instance",
+        http=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert client.mobile_id == 2
+    assert client.register_mobile_device() == 3
+
+    body = json.loads(requests[0].content)
+    assert requests[0].url.path == "/account/mobile-data"
+    assert body["InternalMobileId"] == "app-instance"
+    assert body["Platform"] == "iOS"
+    assert sorted(body) == [
+        "Idiom",
+        "InternalMobileId",
+        "Manufacturer",
+        "Model",
+        "Platform",
+        "VersionString",
+    ]
+    assert client.mobile_id == 3
+    assert store.settings()["mobile_id"] == "3"
+
+
+def test_a_stored_mobile_id_is_reused_and_a_bad_one_falls_back(tmp_path) -> None:
+    store = StateStore(tmp_path / "state.json")
+    store.update_settings(mobile_id="7")
+    client = _stub_client(tmp_path, lambda request: httpx.Response(200, json={}), store=store)
+    assert client.mobile_id == 7
+
+    store.update_settings(mobile_id="not-a-number")
+    client = _stub_client(tmp_path, lambda request: httpx.Response(200, json={}), store=store)
+    assert client.mobile_id == 2
+
+
+def test_registration_rejects_a_mobile_id_that_is_not_an_integer(tmp_path) -> None:
+    client = _stub_client(tmp_path, lambda request: httpx.Response(200, json={"mobileId": "3"}))
+
+    with pytest.raises(HaloAPIError):
+        client.register_mobile_device()
 
 
 def test_account_map_rejects_half_a_viewport(tmp_path) -> None:

@@ -149,7 +149,20 @@ halo map
 halo map 37.4219983 -122.084
 halo walks --page 1 --page-size 30
 halo notifications --page 1 --page-size 30
+halo profile
+halo beacons
+halo subscription
+halo inbox
+halo correction-config
+halo server-time
 ```
+
+`halo inbox` reads `/portal-notification/my/in-app/`, a different feed from the
+`/notification/my/query` history behind `halo notifications`. `halo profile`
+summarizes by default because the payload carries your email addresses, avatar
+URL, and referral link; `beacons`, `subscription`, `inbox`, and
+`correction-config` print in full because nothing in their supported payloads
+needs hiding.
 
 `halo collars`, `halo pets`, `halo fences`, and `halo map` print privacy-reduced
 summaries rather than full Wi-Fi, coordinate, and signed-report-URL data. Pass
@@ -196,6 +209,7 @@ Supported upstream routes:
 | GET | `/pet/my` | `pets()` |
 | GET | `/pet/{id}/` | `pet()` |
 | GET | `/account/my/map` | `account_map()`, `geofences()` |
+| POST | `/account/mobile-data` | `register_mobile_device()` |
 | GET | `/user-profile/` | `user_profile()` |
 | GET | `/beacon/my/` | `beacons()` |
 | GET | `/subscription/my/` | `subscription()` |
@@ -231,6 +245,24 @@ others do not. `/walk/my` pages with `page`/`pageSize` while
 `/notification/my/query` pages with `Page`/`PageSize`; that inconsistency is
 Halo's, not a typo.
 
+### Pets
+
+Halo replaces a pet's profile wholesale rather than patching it, so `update_pet`
+requires all five fields. `halo pet-update` reads the pet first and fills in
+whatever you did not pass, which keeps a single `--weight-kg` from blanking the
+name and breed:
+
+```bash
+halo pet-colors                      # colorHex must come from this list
+halo pet-add --name Scout --color-hex "#FF7A00" --breed goldenretriever \
+    --birthday 2021-04-17 --weight-kg 28.5
+halo pet-update PET_ID --weight-kg 29.2
+```
+
+Saving marks the collar's configuration `outdated` until it next syncs. A new
+pet has no collar until one is bound, so it appears in `halo pets` but not in
+`halo collars`.
+
 ### Fences
 
 Halo has no endpoint that lists fences on their own. `geofences()` and `halo
@@ -251,23 +283,59 @@ with HaloClient() as halo:
     fence = halo.add_geo_fence("Back yard", points)
 ```
 
+From the CLI, boundary corners are repeated `--point LAT,LON` flags in order,
+and at least three are required:
+
+```bash
+halo fence-add "Back yard" --point 40.0001,-75.0001 \
+    --point 40.0002,-75.00015 --point 40.0003,-75.00005
+halo fence-move FENCE_ID --point 40.0001,-75.0001 \
+    --point 40.0002,-75.00015 --point 40.0004,-75.00005
+```
+
 `add_geo_fence`, `update_geo_fence_location`, and `delete_geo_fence` change where
-the collar corrects the dog, and take effect once the collar syncs. `halo
-fence-delete` asks you to type the fence id first; Halo does not return the
-deleted boundary, so re-drawing it is manual.
+the collar corrects the dog, and take effect once the collar syncs. Each CLI
+command asks you to type the fence name or id first, and `--yes` skips that for
+deliberate automation. Halo does not return the boundary that a move or delete
+replaced, so re-drawing it is manual.
 
 The optional `analytics=` argument carries the app's fence-quality telemetry
 (building proximity warnings and similar). It is accepted but not required, and
 this client sends `null` by default.
+
+### Device registration and MobileId
+
+Every instant correction carries a `MobileId`. The apps obtain it by posting
+device details to `/account/mobile-data` after login and reusing the integer
+Halo returns:
+
+```bash
+halo register-device
+```
+
+The id is stored in the state file and used by later corrections.
+`InternalMobileId` is the same per-installation UUID this client already sends
+as `appInstanceId`, so registering twice re-reads one id rather than piling up
+devices. `Platform` follows the OAuth profile, while the model, manufacturer,
+and version describe the machine actually running this client rather than an
+invented handset; `register_mobile_device()` takes overrides for all of them.
+
+Until you register, corrections fall back to the constant `DEFAULT_MOBILE_ID = 2`
+that this client shipped with. That constant was a guess: the one captured
+registration returned `3`, and the value is per-installation, so the fallback is
+almost certainly not the id Halo associates with you. Corrections have been
+accepted anyway, so what Halo does with the field is unknown.
 
 ### Endpoints handling sensitive data
 
 `generate_ecommerce_login_magic_code()` mints a single-use code that signs the
 account into the Halo store. It is a credential — do not log it.
 
-`lookup_parcels()` proxies a third-party property database that the fence editor
-uses to detect buildings. Responses contain real owner names and mailing
-addresses for whoever owns the land, including neighbors. Its envelope's `body`
+`lookup_parcels()` and `halo parcels LAT LON` proxy a third-party property
+database that the fence editor uses to detect buildings. Responses contain real
+owner names and mailing addresses for whoever owns the land, including
+neighbors, so the command prints a warning to stderr and is not summarized —
+there is nothing to redact when the records are the point. Its envelope's `body`
 is a JSON-encoded *string* that must be parsed a second time.
 
 ### Not implemented

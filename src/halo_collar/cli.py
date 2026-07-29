@@ -47,6 +47,46 @@ def _with_full(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     return parser
 
 
+def _pet_profile_arguments(parser: argparse.ArgumentParser, *, required: bool) -> None:
+    """Halo replaces a pet wholesale, so both commands take the same five fields."""
+
+    parser.add_argument("--name", required=required)
+    parser.add_argument("--color-hex", required=required, help="One of `halo pet-colors`.")
+    parser.add_argument("--breed", required=required)
+    parser.add_argument("--birthday", required=required, help="ISO date, for example 2021-04-17.")
+    parser.add_argument("--weight-kg", required=required, type=float)
+
+
+def _fence_point_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--point",
+        action="append",
+        required=True,
+        metavar="LAT,LON",
+        help="A boundary corner; repeat at least three times, in order.",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the interactive confirmation.",
+    )
+
+
+def _points(values: Sequence[str]) -> list[tuple[float, float]]:
+    points = []
+    for value in values:
+        parts = value.split(",")
+        if len(parts) != 2:
+            raise ValueError(f"Expected a LAT,LON pair but got {value!r}.")
+        try:
+            points.append((float(parts[0]), float(parts[1])))
+        except ValueError as exc:
+            raise ValueError(f"Expected a LAT,LON pair but got {value!r}.") from exc
+    if len(points) < 3:
+        raise ValueError("A fence needs at least three boundary points.")
+    return points
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="halo",
@@ -114,6 +154,53 @@ def build_parser() -> argparse.ArgumentParser:
     account_map.add_argument("longitude", type=float, nargs="?")
     account_map.add_argument("--refresh-telemetry", action="store_true")
     account_map.add_argument("--max-corrections", type=int, default=20)
+
+    _with_full(subparsers.add_parser("profile", help="Show the account profile."))
+    subparsers.add_parser("beacons", help="List beacons and their available ranges.")
+    subparsers.add_parser("subscription", help="Show plan, limits, and enabled features.")
+    subparsers.add_parser("inbox", help="List in-app portal notifications.")
+    subparsers.add_parser(
+        "correction-config",
+        help="Show Halo's global sound, vibration, and intensity catalog.",
+    )
+    subparsers.add_parser("server-time", help="Show Halo's UTC server clock.")
+    subparsers.add_parser(
+        "register-device",
+        help="Register this installation and store the MobileId corrections carry.",
+    )
+
+    parcels = subparsers.add_parser(
+        "parcels",
+        help="Look up land-parcel records at a point (returns third-party names).",
+    )
+    parcels.add_argument("latitude", type=float)
+    parcels.add_argument("longitude", type=float)
+    parcels.add_argument("--page", type=int, default=1)
+    parcels.add_argument("--results-per-page", type=int, default=1)
+
+    pet_add = subparsers.add_parser("pet-add", help="Create a pet.")
+    _pet_profile_arguments(pet_add, required=True)
+
+    pet_update = subparsers.add_parser(
+        "pet-update",
+        help="Update a pet; unspecified fields keep their current values.",
+    )
+    pet_update.add_argument("pet_id")
+    _pet_profile_arguments(pet_update, required=False)
+
+    fence_add = subparsers.add_parser(
+        "fence-add",
+        help="Create a containment fence (changes where the collar corrects).",
+    )
+    fence_add.add_argument("name")
+    _fence_point_arguments(fence_add)
+
+    fence_move = subparsers.add_parser(
+        "fence-move",
+        help="Replace a fence's boundary (changes where the collar corrects).",
+    )
+    fence_move.add_argument("fence_id")
+    _fence_point_arguments(fence_move)
 
     walks = subparsers.add_parser("walks", help="List recorded walks.")
     walks.add_argument("--page", type=int, default=1)
@@ -215,6 +302,55 @@ def main(argv: Sequence[str] | None = None) -> int:
                     max_corrections_count=args.max_corrections,
                 )
                 _print_json(account_map if args.full else _safe_map_summary(account_map))
+            elif args.command == "profile":
+                profile = client.user_profile()
+                _print_json(profile if args.full else _safe_profile_summary(profile))
+            elif args.command == "beacons":
+                _print_json(client.beacons())
+            elif args.command == "subscription":
+                _print_json(client.subscription())
+            elif args.command == "inbox":
+                _print_json(client.portal_notifications())
+            elif args.command == "correction-config":
+                _print_json(client.correction_rule_configuration())
+            elif args.command == "server-time":
+                print(client.server_time().isoformat())
+            elif args.command == "register-device":
+                mobile_id = client.register_mobile_device()
+                print(
+                    f"Registered this installation as MobileId {mobile_id}. "
+                    "Corrections now send it instead of the fallback constant."
+                )
+            elif args.command == "parcels":
+                print(
+                    "This returns public land records: real owner names and mailing "
+                    "addresses for whoever owns the land, including neighbors.",
+                    file=sys.stderr,
+                )
+                _print_json(
+                    client.lookup_parcels(
+                        args.latitude,
+                        args.longitude,
+                        page=args.page,
+                        results_per_page=args.results_per_page,
+                    )
+                )
+            elif args.command == "pet-add":
+                _print_json(
+                    client.add_pet(
+                        name=args.name,
+                        color_hex=args.color_hex,
+                        breed=args.breed,
+                        birthday=args.birthday,
+                        weight_kg=args.weight_kg,
+                    )
+                )
+            elif args.command == "pet-update":
+                return _update_pet(args, client)
+            elif args.command == "fence-add":
+                return _add_fence(args, client)
+            elif args.command == "fence-move":
+                return _move_fence(args, client)
             elif args.command == "walks":
                 _print_json(client.walks(page=args.page, page_size=args.page_size))
             elif args.command == "notifications":
@@ -403,6 +539,84 @@ def _delete_fence(args: argparse.Namespace, client: HaloClient) -> int:
     client.delete_geo_fence(args.fence_id)
     print("Fence deleted.")
     return 0
+
+
+def _update_pet(args: argparse.Namespace, client: HaloClient) -> int:
+    """Fill unspecified fields from the stored pet.
+
+    Halo replaces the whole profile rather than patching it, so sending only the
+    flag you meant to change would silently blank the rest.
+    """
+
+    current = client.pet(args.pet_id)
+    birthday = args.birthday if args.birthday is not None else current.get("birthday")
+    weight = args.weight_kg if args.weight_kg is not None else current.get("weightKg")
+    fields = {
+        "name": args.name if args.name is not None else current.get("name"),
+        "color_hex": args.color_hex if args.color_hex is not None else current.get("colorHex"),
+        "breed": args.breed if args.breed is not None else current.get("breed"),
+        "birthday": birthday,
+        "weight_kg": weight,
+    }
+    missing = sorted(key for key, value in fields.items() if value in (None, ""))
+    if missing:
+        raise ValueError(
+            f"Halo requires the full pet profile and the stored pet has no "
+            f"{', '.join(missing)}; pass the matching flag."
+        )
+    _print_json(client.update_pet(args.pet_id, **fields))
+    return 0
+
+
+def _add_fence(args: argparse.Namespace, client: HaloClient) -> int:
+    points = _points(args.point)
+    if not args.yes:
+        print(
+            f"\nThis creates the fence {args.name} from {len(points)} points. It changes "
+            "where the collar corrects the dog once the collar syncs. Preview the boundary "
+            "in the official app if you have not verified these coordinates."
+        )
+        if input(f"Type the fence name ({args.name}) to create it: ").strip() != args.name:
+            print("Cancelled; no fence was created.")
+            return 1
+    _print_json(client.add_geo_fence(args.name, points))
+    return 0
+
+
+def _move_fence(args: argparse.Namespace, client: HaloClient) -> int:
+    points = _points(args.point)
+    if not args.yes:
+        print(
+            f"\nThis replaces fence {args.fence_id} with a new {len(points)}-point boundary. "
+            "The old boundary is not returned, and a dog relying on this fence for "
+            "containment follows the new one once the collar syncs."
+        )
+        if input("Type the fence id to move it: ").strip() != args.fence_id:
+            print("Cancelled; the fence was not moved.")
+            return 1
+    _print_json(client.update_geo_fence_location(args.fence_id, points))
+    return 0
+
+
+def _safe_profile_summary(profile: dict[str, Any]) -> dict[str, Any]:
+    """Avoid dumping email addresses, the avatar URL, and the referral link."""
+
+    coupon = profile.get("referralCoupon")
+    return {
+        "id": profile.get("id"),
+        "userId": profile.get("userId"),
+        "firstName": profile.get("firstName"),
+        "lastName": profile.get("lastName"),
+        "hasChangeEmailRequest": profile.get("hasChangeEmailRequest"),
+        "hasCompletedQuestionnaire": profile.get("hasCompletedQuestionnaire"),
+        "hasFinishedUserGuide": profile.get("hasFinishedUserGuide"),
+        "onboardingProgressState": profile.get("onboardingProgressState"),
+        "referralCoupon": (
+            {"amount": coupon.get("amount"), "canShare": coupon.get("canShare")}
+            if isinstance(coupon, dict)
+            else None
+        ),
+    }
 
 
 def _safe_collar_summary(collars: list[dict[str, Any]]) -> list[dict[str, Any]]:
