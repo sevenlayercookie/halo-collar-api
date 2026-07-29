@@ -183,7 +183,8 @@ refreshtelemetry          true
 
 Complex payloads remain JSON so no fields are lost or misrepresented.
 
-`--full` always implies JSON, since the unredacted payload is nested. Booleans
+`--full` prints the unredacted payload, which is JSON in practice because those
+payloads are the nested ones. Booleans
 and nulls print as Halo spells them, `true` and `null`, rather than as English;
 a `-` in a column means there was nothing to show, which is not the same as Halo
 returning null.
@@ -212,10 +213,10 @@ halo account subscription
 halo notification inbox
 halo correction config
 halo system time
-halo system videos
+halo video list
 ```
 
-`halo system videos` prints a `name -> HLS stream URL` list of the 22 videos the
+`halo video list` prints a `name -> HLS stream URL` list of the 22 videos the
 apps play — onboarding, training, and subscription screens — pulled out of the
 configuration payload, with `--full` adding thumbnails and the section each came
 from. Nothing here is account data: the URLs carry no signature and
@@ -226,6 +227,11 @@ plain `.mp3` URLs under `halo correction config`.
 
 `halo notification inbox` reads `/portal-notification/my/in-app/`, a different
 feed from the `/notification/my/query` history behind `halo notification list`.
+Halo sends all twenty-one notification columns for every type and nulls the ones
+that do not apply, so `notification list` shows when, which pet, the type, and
+the one field that type populates — battery percentage, correction count, zone,
+walk duration, or beacon — with the rest behind `--full`. The paging line goes
+to stderr, so a redirected `notification list` captures only rows.
 `halo account profile` summarizes by default because the payload carries your
 email addresses, avatar URL, and referral link; `beacon list`, `account
 subscription`, `notification inbox`, and `correction config` print in full
@@ -355,7 +361,7 @@ undoes it; `halo pet delete` asks you to type the pet's name first.
 ### Fences
 
 Halo has no endpoint that lists fences on their own. `geofences()` and `halo
-fences` read the `geoFencesInfo.geoFencesToDisplay` array out of the map payload,
+fence list` read the `geoFencesInfo.geoFencesToDisplay` array out of the map payload,
 so listing fences costs one `/account/my/map` call. Note `geoFencesTotalCount`:
 `halo account map` reports it, and a count larger than the returned array means Halo
 truncated the list.

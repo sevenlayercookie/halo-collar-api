@@ -465,6 +465,126 @@ def test_video_index_qualifies_only_the_names_that_repeat() -> None:
     }
 
 
+def test_notification_rows_show_the_field_each_type_populates() -> None:
+    rows = [
+        {
+            "id": "n-1",
+            "type": "collarlowbatterythresholdreached",
+            "date": "2026-07-13T15:47:32Z",
+            "pet": {"id": "pet-1", "name": "Mallard"},
+            "status": "read",
+            "batteryChargePercent": 4,
+            "correctionsCount": None,
+            "notificationZone": None,
+        },
+        {
+            "id": "n-2",
+            "type": "correctionsapplied",
+            "date": "2026-07-14T09:00:00Z",
+            "pet": {"id": "pet-1", "name": "Mallard"},
+            "status": "unread",
+            "batteryChargePercent": None,
+            "correctionsCount": 3,
+            "notificationZone": "warning",
+        },
+        {
+            "id": "n-3",
+            "type": "somethingnew",
+            "date": None,
+            "pet": None,
+            "status": "unread",
+            "title": "A type this client has never seen",
+        },
+    ]
+
+    assert [cli._notification_row(row) for row in rows] == [
+        {
+            "when": "2026-07-13 15:47",
+            "pet": "Mallard",
+            "type": "collarlowbatterythresholdreached",
+            "detail": "4% battery",
+            "status": "read",
+            "id": "n-1",
+        },
+        {
+            "when": "2026-07-14 09:00",
+            "pet": "Mallard",
+            "type": "correctionsapplied",
+            "detail": "3 corrections",
+            "status": "unread",
+            "id": "n-2",
+        },
+        {
+            "when": None,
+            "pet": None,
+            "type": "somethingnew",
+            "detail": "A type this client has never seen",
+            "status": "unread",
+            "id": "n-3",
+        },
+    ]
+
+
+def test_notification_list_tables_the_rows_and_notes_the_page(capsys) -> None:
+    class FakeClient:
+        def notifications(self, *, page, page_size):
+            return {
+                "pageNumber": 2,
+                "pageSize": 30,
+                "totalNumberOfPages": 4,
+                "totalNumberOfItems": 97,
+                "results": [
+                    {
+                        "id": "n-1",
+                        "type": "collarlowbatterythresholdreached",
+                        "date": "2026-07-13T15:47:32Z",
+                        "pet": {"name": "Mallard"},
+                        "status": "read",
+                        "batteryChargePercent": 4,
+                    }
+                ],
+            }
+
+    result = cli._notification_list(args(page=2, page_size=30, full=False), FakeClient(), Output())
+
+    assert result == 0
+    captured = capsys.readouterr()
+    assert captured.out.splitlines()[0].split() == [
+        "WHEN",
+        "PET",
+        "TYPE",
+        "DETAIL",
+        "STATUS",
+        "ID",
+    ]
+    assert "4% battery" in captured.out
+    # Paging is metadata about the request, so it must not land in the pipe.
+    assert "Page 2 of 4 (97 notifications)." in captured.err
+    assert "Page 2" not in captured.out
+
+
+def test_notification_list_full_keeps_the_whole_envelope(capsys) -> None:
+    """--full means unredacted, so the paging envelope and every field survive."""
+
+    envelope = {
+        "pageNumber": 1,
+        "results": [{"id": "n-1", "type": "x", "walkId": None, "calibrationId": "c-1"}],
+    }
+
+    class FakeClient:
+        def notifications(self, *, page, page_size):
+            return envelope
+
+    result = cli._notification_list(args(page=1, page_size=30, full=True), FakeClient(), Output())
+
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "pageNumber" in out
+    assert "CALIBRATIONID" in out
+    # The curated view is not applied on top of the raw payload.
+    assert "DETAIL" not in out
+
+
 def test_pet_update_keeps_unspecified_fields(capsys) -> None:
     sent: dict[str, object] = {}
 
