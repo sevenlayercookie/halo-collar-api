@@ -98,3 +98,85 @@ def test_pet_summary_hides_coordinates_and_report_urls() -> None:
     rendered = json.dumps(summary)
     for secret in ("40.0001", "-75.0001", "signed.example", "Home Network"):
         assert secret not in rendered
+
+
+def fences() -> list[dict[str, object]]:
+    return [
+        {
+            "id": "fence-1",
+            "name": "Home",
+            "description": None,
+            "activityType": "active",
+            "isEnabled": True,
+            "publicVisibilityType": "private",
+            "address": {"city": "Springfield", "publicPlaceName": None},
+            "thumbnailUrl": "https://haloprodst.blob.core.windows.net/f.png?sig=SECRETSIG&se=z",
+            "petsSync": [{"petId": "pet-1", "isAssigned": True, "status": "completed"}],
+            "zones": [
+                {
+                    "type": "safe",
+                    "locationPoints": [
+                        {"latitude": 40.0001, "longitude": -75.0001},
+                        {"latitude": 40.0002, "longitude": -75.0002},
+                    ],
+                },
+                {
+                    "type": "danger",
+                    "locationPoints": [{"latitude": 40.0003, "longitude": -75.0003}],
+                },
+            ],
+        }
+    ]
+
+
+def test_fence_summary_hides_zone_coordinates_address_and_thumbnail() -> None:
+    summary = cli._safe_fence_summary(fences())
+
+    assert summary[0]["name"] == "Home"
+    assert summary[0]["isEnabled"] is True
+    assert summary[0]["zones"] == [
+        {"type": "safe", "pointCount": 2},
+        {"type": "danger", "pointCount": 1},
+    ]
+    assert summary[0]["petsSync"] == [{"petId": "pet-1", "isAssigned": True, "status": "completed"}]
+    rendered = json.dumps(summary)
+    for secret in ("40.0001", "-75.0003", "SECRETSIG", "Springfield", "blob.core.windows.net"):
+        assert secret not in rendered
+
+
+def test_map_summary_redacts_pets_and_fences_and_counts_corrections() -> None:
+    summary = cli._safe_map_summary(
+        {
+            "pets": [
+                {
+                    "id": "pet-1",
+                    "name": "Alpha",
+                    "telemetry": {"latitude": 40.0001, "longitude": -75.0001},
+                }
+            ],
+            "geoFencesInfo": {"geoFencesToDisplay": fences(), "geoFencesTotalCount": 3},
+            "corrections": [{"id": "correction-1"}, {"id": "correction-2"}],
+        }
+    )
+
+    assert summary["geoFencesTotalCount"] == 3
+    assert summary["correctionCount"] == 2
+    assert summary["pets"][0]["name"] == "Alpha"
+    assert summary["fences"][0]["zones"] == [
+        {"type": "safe", "pointCount": 2},
+        {"type": "danger", "pointCount": 1},
+    ]
+    rendered = json.dumps(summary)
+    for secret in ("40.0001", "SECRETSIG", "Springfield"):
+        assert secret not in rendered
+
+
+def test_map_summary_tolerates_missing_sections() -> None:
+    summary = cli._safe_map_summary({})
+
+    assert summary == {
+        "pets": None,
+        "fences": None,
+        "geoFencesTotalCount": None,
+        "correctionCount": None,
+    }

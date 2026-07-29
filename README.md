@@ -142,21 +142,38 @@ halo status
 halo configuration
 halo collars
 halo pets
+halo fences
 halo pet PET_ID
 halo pet PET_ID --refresh-telemetry
+halo map
 halo map 37.4219983 -122.084
 halo walks --page 1 --page-size 30
 halo notifications --page 1 --page-size 30
 ```
 
-`halo collars` and `halo pets` print privacy-reduced summaries rather than full
-Wi-Fi, coordinate, and signed-report-URL data. `halo pets` reaches every pet on
-the account, including ones that have never had a collar assigned and so never
-appear in `halo collars`. Use `halo pet PET_ID` for the full object.
+`halo collars`, `halo pets`, `halo fences`, and `halo map` print privacy-reduced
+summaries rather than full Wi-Fi, coordinate, and signed-report-URL data. Pass
+`--full` to any of them for Halo's complete response. Nothing is withheld from
+you: the summary is only the default so that a command you ran to check a
+battery level does not put your home coordinates into a screenshot, a shell
+history, or a pasted bug report. The Python API always returns whole payloads.
+
+`halo pets` reaches every pet on the account, including ones that have never had
+a collar assigned and so never appear in `halo collars`. Use `halo pet PET_ID`
+for the full object; it is unsummarized and needs no `--full`.
+
+`halo fences` lists the account's geofences, which Halo returns only inside the
+map payload. The summary keeps names, enabled state, zone types with a point
+count, and per-pet sync status, and drops the zone polygons, the fence address,
+and the signed thumbnail URL.
 
 `halo map` calls `/account/my/map`, which the app polls on its home screen. One
 response returns `pets` (each with its collar embedded), `geoFencesInfo`, and
-`corrections`, so prefer it over several separate calls when polling.
+`corrections`, so prefer it over several separate calls when polling. The apps
+always send a viewport centre, but Halo returns the whole account without one,
+so the coordinates are optional here and on `HaloClient.account_map`. The
+summary counts `corrections` rather than redacting them, because no capture has
+ever shown that list populated and there is no verified shape to trust.
 
 ## Locate a collar
 
@@ -178,7 +195,7 @@ Supported upstream routes:
 | GET | `/collar/my/` | `collars()` |
 | GET | `/pet/my` | `pets()` |
 | GET | `/pet/{id}/` | `pet()` |
-| GET | `/account/my/map` | `account_map()` |
+| GET | `/account/my/map` | `account_map()`, `geofences()` |
 | GET | `/user-profile/` | `user_profile()` |
 | GET | `/beacon/my/` | `beacons()` |
 | GET | `/subscription/my/` | `subscription()` |
@@ -215,6 +232,12 @@ others do not. `/walk/my` pages with `page`/`pageSize` while
 Halo's, not a typo.
 
 ### Fences
+
+Halo has no endpoint that lists fences on their own. `geofences()` and `halo
+fences` read the `geoFencesInfo.geoFencesToDisplay` array out of the map payload,
+so listing fences costs one `/account/my/map` call. Note `geoFencesTotalCount`:
+`halo map` reports it, and a count larger than the returned array means Halo
+truncated the list.
 
 Fence geometry is a list of `(latitude, longitude)` corners; Halo needs at least
 three. The app previews the derived safe zone while dragging, then saves:
@@ -317,6 +340,9 @@ with HaloClient() as halo:
 
     # One aggregate call instead of several, for polling.
     view = halo.account_map(37.4219983, -122.084, refresh_telemetry=True)
+
+    # The coordinates are optional; without them Halo still returns the account.
+    fences = halo.geofences()
 
     # Both return the same paged envelope:
     # {"pageNumber", "pageSize", "totalNumberOfPages", "totalNumberOfItems", "results"}
