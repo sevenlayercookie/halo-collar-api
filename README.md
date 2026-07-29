@@ -155,7 +155,17 @@ halo subscription
 halo inbox
 halo correction-config
 halo server-time
+halo videos
 ```
+
+`halo videos` prints a `name -> HLS stream URL` list of the 22 videos the apps
+play — onboarding, training, and subscription screens — pulled out of the
+configuration payload, with `--full` adding thumbnails and the section each came
+from. Nothing here is account data: the URLs carry no signature and
+`/configuration/` needs no login, so this is the one read command that works
+logged out, and the streams play directly in `mpv`, `ffplay`, or VLC. The same
+payload also holds the collar's 21 correction sounds and 6 vibration files as
+plain `.mp3` URLs under `halo correction-config`.
 
 `halo inbox` reads `/portal-notification/my/in-app/`, a different feed from the
 `/notification/my/query` history behind `halo notifications`. `halo profile`
@@ -204,7 +214,7 @@ Supported upstream routes:
 
 | Method | Path | Client method |
 | --- | --- | --- |
-| GET | `/configuration/` | `configuration()` |
+| GET | `/configuration/` | `configuration()`, `videos()` |
 | GET | `/collar/my/` | `collars()` |
 | GET | `/pet/my` | `pets()` |
 | GET | `/pet/{id}/` | `pet()` |

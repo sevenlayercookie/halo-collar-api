@@ -501,6 +501,40 @@ def test_registration_rejects_a_mobile_id_that_is_not_an_integer(tmp_path) -> No
         client.register_mobile_device()
 
 
+def test_videos_are_gathered_from_wherever_the_configuration_holds_them(tmp_path) -> None:
+    configuration = {
+        "lms": {
+            "trainingWelcomeVideo": {
+                "videoStreamUrl": "https://cdn.example/welcome.m3u8",
+                "thumbnailUrl": "https://cdn.example/welcome.jpg",
+            }
+        },
+        "onboarding": {
+            "screens": [
+                {
+                    "getStartedVideo": {
+                        "videoStreamUrl": "https://cdn.example/started.m3u8",
+                        "thumbnailUrl": None,
+                    }
+                }
+            ]
+        },
+        "collar": {"images": {"squareSmallImageUrl": "https://cdn.example/collar.png"}},
+    }
+    client = _stub_client(tmp_path, lambda _: httpx.Response(200, json=configuration))
+
+    videos = client.videos()
+
+    # Nested under a list, and the plain image is not mistaken for a video.
+    assert sorted(video["name"] for video in videos) == [
+        "getStartedVideo",
+        "trainingWelcomeVideo",
+    ]
+    started = next(video for video in videos if video["name"] == "getStartedVideo")
+    assert started["section"] == "onboarding.screens.0"
+    assert started["thumbnailUrl"] is None
+
+
 def test_a_mutation_learns_the_parallel_call_version_before_writing(tmp_path) -> None:
     requests: list[httpx.Request] = []
 
