@@ -636,6 +636,67 @@ def test_find_collar_rejects_path_injection(tmp_path) -> None:
         client.find_collar("../pet/x/run-instant-correction")
 
 
+def test_collar_binding_routes_match_the_observed_bodies(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/collar/check-can-be-bound-to-user":
+            return httpx.Response(
+                200,
+                json={
+                    "result": True,
+                    "collarType": "version5",
+                    "collarRequiresReactivationFee": False,
+                },
+            )
+        if request.url.path == "/collar/bind-to-user":
+            return httpx.Response(
+                200,
+                json={
+                    "collar": {
+                        "id": "collar-1",
+                        "type": "version5",
+                        "serialNumber": "26h5160491th",
+                    },
+                    "reportedConfigurationVersionBeforeBinding": "1",
+                },
+            )
+        raise AssertionError(request.url)
+
+    client = _stub_client(tmp_path, handler)
+    eligibility = client.check_collar_binding("26h5160491th")
+    bound = client.bind_collar("26h5160491th", "encrypted-serial")
+
+    assert eligibility["result"] is True
+    assert bound["collar"]["id"] == "collar-1"
+    assert [request.method for request in requests] == ["PUT", "PUT"]
+    assert [request.url.path for request in requests] == [
+        "/collar/check-can-be-bound-to-user",
+        "/collar/bind-to-user",
+    ]
+    assert json.loads(requests[0].content) == {"SerialNumber": "26h5160491th"}
+    assert json.loads(requests[1].content) == {
+        "SerialNumber": "26h5160491th",
+        "EncryptedSerialNumber": "encrypted-serial",
+    }
+
+
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [
+        ("check_collar_binding", (" ",)),
+        ("bind_collar", (" ", "encrypted-serial")),
+        ("bind_collar", ("26h5160491th", "")),
+    ],
+)
+def test_collar_binding_requires_serial_values(tmp_path, method, args) -> None:
+    client = _stub_client(tmp_path, lambda _: pytest.fail("request should not be sent"))
+
+    with pytest.raises(ValueError, match="required"):
+        getattr(client, method)(*args)
+
+
 def test_push_subscription_matches_the_expected_bodies(tmp_path) -> None:
     requests: list[httpx.Request] = []
 

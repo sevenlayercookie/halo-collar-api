@@ -313,6 +313,25 @@ This plays the collar's locate tone. It is a physical action, but an
 audible-only one — unlike a correction it is not aversive, so no command number
 is reserved and Halo answers `204 No Content`.
 
+## Bind a collar
+
+Check whether the printed serial can be added to the authenticated account:
+
+```bash
+halo collar check-binding PRINTED_SERIAL
+```
+
+Binding also requires the encrypted serial read from the physical collar over
+Bluetooth. The printed serial and the hardware `uuId` returned by account APIs
+are not known substitutes:
+
+```bash
+halo collar bind PRINTED_SERIAL ENCRYPTED_SERIAL
+```
+
+The bind command asks you to type the printed serial before changing the
+account. Pass `--yes` for an intentional non-interactive call.
+
 ## Endpoint coverage
 
 Supported upstream routes:
@@ -321,6 +340,8 @@ Supported upstream routes:
 | --- | --- | --- |
 | GET | `/configuration/` | `configuration()`, `videos()` |
 | GET | `/collar/my/` | `collars()` |
+| PUT | `/collar/check-can-be-bound-to-user` | `check_collar_binding()` |
+| PUT | `/collar/bind-to-user` | `bind_collar()` |
 | GET | `/pet/my` | `pets()` |
 | GET | `/pet/{id}/` | `pet()` |
 | GET | `/account/my/map` | `account_map()`, `geofences()` |

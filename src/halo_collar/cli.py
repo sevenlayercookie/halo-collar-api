@@ -592,8 +592,8 @@ def _build_collar(subparsers: Any) -> None:
     collar = _group(
         subparsers,
         "collar",
-        help_text="List collars and play a collar's locate tone.",
-        description="Work with the collars bound to pets on the account.",
+        help_text="List, bind, and locate collars.",
+        description="Work with collars bound to, or being added to, the account.",
     )
     _with_full(
         _leaf(
@@ -620,6 +620,48 @@ def _build_collar(subparsers: Any) -> None:
         handler=_collar_locate,
     )
     locate.add_argument("collar_id", help="The collar's UUID, from `halo collar list`.")
+
+    check_binding = _leaf(
+        collar,
+        "check-binding",
+        help_text="Check whether a collar can be bound to this account.",
+        description=(
+            "Ask Halo whether the printed collar serial can be bound to this account. "
+            "A successful request may still return result=false with the reason."
+        ),
+        examples="  halo collar check-binding PRINTED_SERIAL",
+        handler=_collar_check_binding,
+    )
+    check_binding.add_argument(
+        "serial_number",
+        help="The serial number printed on the physical collar.",
+    )
+
+    bind = _with_confirmation(
+        _leaf(
+            collar,
+            "bind",
+            help_text="Bind a physical collar to this account.",
+            description=(
+                "Bind a collar using its printed serial and the encrypted serial read "
+                "from the physical collar over Bluetooth. A hardware uuId from an "
+                "account response is not known to be a substitute."
+            ),
+            examples=(
+                "  halo collar bind PRINTED_SERIAL ENCRYPTED_SERIAL\n"
+                "  halo collar bind PRINTED_SERIAL ENCRYPTED_SERIAL --yes"
+            ),
+            handler=_collar_bind,
+        )
+    )
+    bind.add_argument(
+        "serial_number",
+        help="The serial number printed on the physical collar.",
+    )
+    bind.add_argument(
+        "encrypted_serial_number",
+        help="The encrypted serial returned by the physical collar over Bluetooth.",
+    )
 
 
 def _build_fence(subparsers: Any) -> None:
@@ -1346,6 +1388,33 @@ def _collar_list(args: argparse.Namespace, client: HaloClient, out: Output) -> i
 def _collar_locate(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
     client.find_collar(args.collar_id)
     out.note("Halo accepted the locate request. The collar plays its tone if reachable.")
+    return EXIT_OK
+
+
+def _collar_check_binding(
+    args: argparse.Namespace,
+    client: HaloClient,
+    out: Output,
+) -> int:
+    out.emit(client.check_collar_binding(args.serial_number))
+    return EXIT_OK
+
+
+def _collar_bind(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    if not _confirmed(
+        args,
+        out,
+        warning=(
+            f"\nThis will bind collar {args.serial_number} to the authenticated Halo account."
+        ),
+        prompt=f"Type the printed serial ({args.serial_number}) to bind it: ",
+        expected=args.serial_number,
+        cancelled="Cancelled; the collar was not bound.",
+    ):
+        return EXIT_NO_LOGIN
+    bound = client.bind_collar(args.serial_number, args.encrypted_serial_number)
+    out.note(f"Bound collar {args.serial_number}.")
+    out.emit(bound)
     return EXIT_OK
 
 

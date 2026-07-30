@@ -106,6 +106,14 @@ def test_a_noun_without_a_verb_shows_that_nouns_help(capsys) -> None:
         assert verb in out
 
 
+def test_collar_help_lists_binding_commands(capsys) -> None:
+    assert cli.main(["collar"]) == 0
+
+    out = capsys.readouterr().out
+    for verb in ("list", "locate", "check-binding", "bind"):
+        assert verb in out
+
+
 def test_help_reaches_every_level(capsys) -> None:
     assert cli.main(["help"]) == 0
     assert "<noun>" in capsys.readouterr().out
@@ -882,6 +890,79 @@ def test_yes_skips_the_prompt_for_scripts(capsys) -> None:
     assert cli._pet_delete(args(pet_id="pet-1", yes=True), FakeClient(), Output()) == 0
     assert deleted == ["pet-1"]
     assert "Deleted Alpha" in capsys.readouterr().err
+
+
+def test_collar_check_binding_emits_the_complete_result(capsys) -> None:
+    response = {
+        "result": False,
+        "isCollarBoundToCurrentUser": True,
+        "collarType": "version5",
+    }
+
+    class FakeClient:
+        def check_collar_binding(self, serial_number):
+            assert serial_number == "26h5160491th"
+            return response
+
+    assert (
+        cli._collar_check_binding(
+            args(serial_number="26h5160491th"),
+            FakeClient(),
+            Output(as_json=True),
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out) == response
+
+
+def test_collar_bind_accepts_yes_and_emits_the_result(capsys) -> None:
+    response = {
+        "collar": {
+            "id": "collar-1",
+            "type": "version5",
+            "serialNumber": "26h5160491th",
+        }
+    }
+
+    class FakeClient:
+        def bind_collar(self, serial_number, encrypted_serial_number):
+            assert serial_number == "26h5160491th"
+            assert encrypted_serial_number == "encrypted-serial"
+            return response
+
+    assert (
+        cli._collar_bind(
+            args(
+                serial_number="26h5160491th",
+                encrypted_serial_number="encrypted-serial",
+                yes=True,
+            ),
+            FakeClient(),
+            Output(as_json=True),
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == response
+    assert "Bound collar 26h5160491th" in captured.err
+
+
+def test_collar_bind_needs_confirmation_without_a_terminal() -> None:
+    class FakeClient:
+        def bind_collar(self, *_):
+            pytest.fail("collar should not be bound")
+
+    with pytest.raises(ValueError, match="--yes"):
+        cli._collar_bind(
+            args(
+                serial_number="26h5160491th",
+                encrypted_serial_number="encrypted-serial",
+                yes=False,
+                no_input=True,
+            ),
+            FakeClient(),
+            Output(),
+        )
 
 
 def test_pet_delete_cancels_unless_the_name_is_typed(monkeypatch, capsys, interactive) -> None:

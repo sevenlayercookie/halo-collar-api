@@ -188,6 +188,44 @@ class HaloClient:
             raise HaloAPIError("Halo returned an unexpected collar list.")
         return value
 
+    def check_collar_binding(self, serial_number: str) -> dict[str, Any]:
+        """Check whether a collar can be bound to the authenticated account.
+
+        ``serial_number`` is the value printed on the collar. The response
+        explains why binding is unavailable when its ``result`` field is false.
+        """
+
+        return self._put_object(
+            "/collar/check-can-be-bound-to-user",
+            json_body={"SerialNumber": _required(serial_number, "serial_number")},
+        )
+
+    def bind_collar(
+        self,
+        serial_number: str,
+        encrypted_serial_number: str,
+    ) -> dict[str, Any]:
+        """Bind a physical collar to the authenticated account.
+
+        ``encrypted_serial_number`` must come from the collar over Bluetooth;
+        the printed serial number or the ``uuId`` in an account response is not
+        known to be a substitute.
+
+        This route and request shape have been observed, but a successful live
+        response has not yet been independently verified.
+        """
+
+        return self._put_object(
+            "/collar/bind-to-user",
+            json_body={
+                "SerialNumber": _required(serial_number, "serial_number"),
+                "EncryptedSerialNumber": _required(
+                    encrypted_serial_number,
+                    "encrypted_serial_number",
+                ),
+            },
+        )
+
     def pet(self, pet_id: str, *, refresh_telemetry: bool = False) -> dict[str, Any]:
         """Fetch a pet, optionally asking the collar for fresher telemetry."""
 
