@@ -9,7 +9,7 @@ from typing import Any
 
 
 class CorrectionType(str, Enum):
-    """Correction names supported in the official iOS client's REST API."""
+    """Correction names supported by the Halo Collar API."""
 
     WARNING = "Warning"
     FIRST_TIME = "FirstTime"

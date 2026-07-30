@@ -40,7 +40,7 @@ def test_session_is_bound_to_client_profile_and_tokens_can_be_cleared(tmp_path) 
         "client_id": "halo.app.android",
         "app_version": "2.12.0.590",
     }
-    # The app credential is a constant of the official app and is never persisted.
+    # The application credential is never persisted.
     assert "client_secret" not in store.path.read_text()
     assert store.clear_tokens()
     with pytest.raises(LoginRequiredError):

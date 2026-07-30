@@ -1,4 +1,4 @@
-"""Async, receive-only client for Halo's supported SignalR hubs."""
+"""Async, receive-only client for Halo's SignalR hubs."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class SignalRHub(str, Enum):
-    """Halo hubs supported in official upstream API."""
+    """Halo SignalR hubs supported by this client."""
 
     TELEMETRY = "TelemetryHub"
     NOTIFICATIONS = "NotificationHub"

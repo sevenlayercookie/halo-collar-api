@@ -101,7 +101,7 @@ RETIRED_COMMANDS = {
 }
 
 CONCISE_HELP = f"""\
-halo — unofficial client for the supported Halo Collar API
+halo — unofficial client for the Halo Collar API
 
 USAGE
   halo <noun> <verb> [flags]
@@ -328,7 +328,7 @@ def _points(values: Sequence[str]) -> list[tuple[float, float]]:
 def build_parser() -> argparse.ArgumentParser:
     parser = _HelpfulParser(
         prog="halo",
-        description="Unofficial client for the supported Halo Collar API.",
+        description="Unofficial client for the Halo Collar API.",
         epilog=f"Run `halo help` for a tour.\nReport problems at {SUPPORT_URL}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         parents=[_common_flags()],
@@ -394,7 +394,7 @@ def _build_auth(subparsers: Any) -> None:
         "--password",
         dest="password_grant",
         action="store_true",
-        help="Prompt for Halo email/password and use the supported Android password grant.",
+        help="Prompt for Halo email/password and use the Android password grant.",
     )
     mode.add_argument(
         "--from-refresh-token",
@@ -888,7 +888,7 @@ def _build_correction(subparsers: Any) -> None:
     send.add_argument(
         "correction_type",
         choices=[item.value for item in CorrectionType],
-        help="Which supported correction enum to send.",
+        help="Which correction enum to send.",
     )
     send.add_argument(
         "--command-number",
@@ -1091,7 +1091,7 @@ def _auth_login(args: argparse.Namespace, _: HaloClient | None, out: Output) -> 
     if args.no_browser and (args.password_grant or args.from_refresh_token):
         raise ValueError("--no-browser applies only to the hosted browser login.")
     if args.password_grant and args.platform not in (None, "android"):
-        raise ValueError("The supported password grant belongs to the Android client.")
+        raise ValueError("The password grant belongs to the Android client.")
     if args.password_grant:
         profile = ANDROID_PROFILE
     elif args.platform:
@@ -1557,8 +1557,8 @@ def _correction_send(args: argparse.Namespace, client: HaloClient, out: Output) 
         args,
         out,
         warning=(
-            f"\nThis will send {kind.value} to {pet_name}. Halo accepted this enum in the "
-            "API, but its physical effect depends on the collar configuration.\n"
+            f"\nThis will send {kind.value} to {pet_name}. Halo accepts this enum, "
+            "but its physical effect depends on the collar configuration.\n"
             "For first tests, remove the collar from the dog and use the lowest safe "
             "feedback level."
         ),

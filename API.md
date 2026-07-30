@@ -1,10 +1,8 @@
 # Halo Collar Python API reference
 
 > [!IMPORTANT]
-> This is an unofficial client. It is not affiliated with,
-> endorsed by, or supported by Halo Collar. The interfaces described here were
-> unspecified from supported iOS and Android upstream API and may change without
-> notice.
+> This is an unofficial client. It is not affiliated with, endorsed by, or
+> supported by Halo Collar. Upstream interfaces may change without notice.
 
 This document describes the public Python API, live SignalR API, persistence
 model, exceptions, and supported HTTP routes in `halo-collar` 0.1.0. See the
@@ -60,7 +58,7 @@ from halo_collar import (
 ```
 
 HTTP responses intentionally remain dictionaries and lists. The upstream schema
-is undocumented and can change independently of this package.
+can change independently of this package.
 
 ## Authentication
 
@@ -101,7 +99,7 @@ unless one is supplied.
 | `begin_login()` | `AuthorizationFlow` | Create the hosted-login URL, PKCE verifier, state, and nonce. |
 | `complete_login(callback_url, flow)` | `TokenSet` | Validate a `haloapp://callback` URL and exchange its authorization code. |
 | `complete_login_from_browser_capture(capture, flow)` | `TokenSet` | Extract the callback from raw HTTP or a WebInspector HAR export. |
-| `password_login(username, password)` | `TokenSet` | Use the supported Android password grant. The password is not retained. |
+| `password_login(username, password)` | `TokenSet` | Use the Android password grant. The password is not retained. |
 | `refresh(refresh_token)` | `TokenSet` | Exchange and rotate a refresh token. |
 | `close()` | `None` | Close an internally owned HTTP client. |
 
@@ -134,7 +132,7 @@ browser capture in source code, shell history, logs, or a Git repository.
 
 ### Authentication models
 
-`OAuthClientProfile` describes an supported official-app OAuth identity:
+`OAuthClientProfile` describes a Halo mobile OAuth identity:
 
 - `name`
 - `client_id`
@@ -199,7 +197,7 @@ The client does not automatically retry other network failures.
 
 ### Read methods
 
-| Method | Return type | Supported operation |
+| Method | Return type | Operation |
 | --- | --- | --- |
 | `configuration()` | `dict` | Public application configuration. No login required. |
 | `videos()` | `list[dict]` | HLS video assets derived locally from `configuration()`. |
@@ -224,7 +222,7 @@ The client does not automatically retry other network failures.
 | `collar_for_pet(pet_id)` | `dict` | Find a pet's assigned collar from `collars()`. |
 | `collar_is_online(collar)` | `bool` | Test locally for a socket-connected Wi-Fi or cellular adapter. |
 
-`walks()` and `notifications()` return the supported paging envelope:
+`walks()` and `notifications()` return the paging envelope:
 `pageNumber`, `pageSize`, `totalNumberOfPages`, `totalNumberOfItems`, and
 `results`.
 
@@ -439,7 +437,7 @@ HaloError
 `StaleCommandNumberError` exposes Halo's `current_command_number` and decoded
 response.
 
-## Supported HTTP route map
+## HTTP route map
 
 These are upstream Halo routes called by `HaloClient`; this project does not run
 an HTTP server of its own.
@@ -483,5 +481,5 @@ an HTTP server of its own.
 | `PUT` | `/push-notification/subscribe` | `subscribe_push_notifications()` |
 | `PUT` | `/push-notification/unsubscribe-device` | `unsubscribe_push_device()` |
 
-Route spelling, capitalization, and trailing slashes match supported API.
-No stability guarantee is possible for these undocumented upstream interfaces.
+Route spelling, capitalization, and trailing slashes match the upstream API.
+No stability guarantee is possible for these upstream interfaces.

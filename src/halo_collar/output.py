@@ -427,7 +427,7 @@ def safe_map_summary(account_map: dict[str, Any]) -> dict[str, Any]:
         "geoFencesTotalCount": (
             fences_info.get("geoFencesTotalCount") if isinstance(fences_info, dict) else None
         ),
-        # The correction records have has no stable populated shape, so there is
-        # no verified shape to redact; --full is the honest way to read them.
+        # Correction records have no stable privacy-safe summary shape; --full
+        # is the honest way to read them.
         "correctionCount": len(corrections) if isinstance(corrections, list) else None,
     }

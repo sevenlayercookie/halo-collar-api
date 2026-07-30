@@ -1,4 +1,4 @@
-"""Synchronous client for the supported Halo Collar REST endpoints."""
+"""Synchronous client for Halo Collar REST endpoints."""
 
 from __future__ import annotations
 
@@ -38,10 +38,10 @@ _UNKNOWN_PARALLEL_CALL_VERSION = "0"
 
 
 class HaloClient:
-    """A conservative client for endpoints confirmed in supported API.
+    """A conservative client for supported Halo Collar endpoints.
 
-    Responses remain dictionaries because the upstream server schema may
-    change. The client intentionally performs no automatic network retries.
+    Responses remain dictionaries because the server schema may change. The
+    client intentionally performs no automatic network retries.
     """
 
     def __init__(
@@ -83,8 +83,8 @@ class HaloClient:
             app_instance_id or settings.get("app_instance_id") or str(uuid.uuid4())
         )
         # The apps send the session's start time in milliseconds. It only feeds
-        # Halo's analytics, but sending it keeps requests shaped like the client
-        # whose API behavior this library was compatible with.
+        # Halo's analytics, but sending it keeps requests compatible with the
+        # mobile API.
         self.amplitude_session_id = amplitude_session_id or str(
             int(datetime.now(timezone.utc).timestamp() * 1000)
         )
@@ -93,8 +93,8 @@ class HaloClient:
         )
         self.app_version = app_version or stored_app_version or self.profile.app_version
         # Halo assigns this when a device registers; corrections carry it. The
-        # value differs per installation, so a stored one always beats
-        # the constant this client falls back to.
+        # value differs per installation, so a stored one always beats the
+        # constant this client falls back to.
         stored_mobile_id = settings.get("mobile_id")
         try:
             self.mobile_id = int(stored_mobile_id) if stored_mobile_id else DEFAULT_MOBILE_ID
@@ -944,8 +944,8 @@ def _pet_body(
         "Name": _required(name, "name"),
         "ColorHex": _required(color_hex, "color_hex"),
         "Breed": _required(breed, "breed"),
-        # Seconds precision, matching the API; Halo normalizes the
-        # value to UTC in its response either way.
+        # Halo accepts seconds precision and normalizes the value to UTC in its
+        # response.
         "Birthday": (
             birthday.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             if isinstance(birthday, datetime)

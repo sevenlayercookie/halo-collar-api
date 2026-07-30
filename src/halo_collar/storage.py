@@ -162,9 +162,8 @@ class StateStore:
     ) -> None:
         """Atomically bind tokens to the OAuth client that issued them.
 
-        The app credential is deliberately not persisted: it is a constant of the
-        official app, so keeping a copy on disk would only pin users to a stale
-        value once Halo rotates it.
+        The application credential is deliberately not persisted. Keeping a
+        copy on disk would pin users to a stale value if Halo rotates it.
         """
 
         if not client_id or not app_version:

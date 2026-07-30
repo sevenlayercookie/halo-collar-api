@@ -1,10 +1,11 @@
 # Unofficial Halo Collar Python client
 
 > [!IMPORTANT]
-> This is an unofficial project. It is not affiliated with,
-> endorsed by, or supported by Halo Collar.
+> This is an unofficial project. It is not affiliated with, endorsed by, or
+> supported by Halo Collar.
 
-This project is a conservative Python client for Halo Collar REST and SignalR APIs.
+This project is a conservative Python client for the Halo Collar REST and
+SignalR APIs.
 
 ## Documentation
 
@@ -13,9 +14,9 @@ This project is a conservative Python client for Halo Collar REST and SignalR AP
 - [Safety and privacy](#safety-and-privacy)
 - [Roadmap](#roadmap)
 
-Implemented, supported functionality:
+Implemented functionality:
 
-- OAuth 2.0 password login using the supported Android client
+- OAuth 2.0 password login using the Android profile
 - OAuth 2.0 Authorization Code login with PKCE through Halo's hosted login page
 - Refresh-token login and automatic access-token refresh/rotation
 - Public application configuration
@@ -84,8 +85,8 @@ automatically; you do not need to enter the password again unless the refresh
 token dies or is revoked.
 
 Both the iOS and Android OAuth client credentials are embedded in the package
-because they are application constants distributed inside the official apps, not
-per-user secrets. No login mode needs you to supply one.
+because they are application constants rather than per-user secrets. No login
+mode needs you to supply one.
 
 Each profile's credential is resolved in this order: an explicit argument, the
 per-profile `HALO_IOS_CLIENT_SECRET` / `HALO_ANDROID_CLIENT_SECRET`, the generic
@@ -107,7 +108,7 @@ flow remains available as a fallback.
 halo --timezone America/Chicago auth login
 ```
 
-The command uses the supported iOS profile and opens Halo's hosted login page with
+The command uses the iOS profile and opens Halo's hosted login page with
 a fresh PKCE verifier, state, and nonce. This project never receives your
 email/password or automates the hosted form. After login, paste the response's full
 `Location: haloapp://callback?...` value at the hidden prompt. No browser cookies
@@ -248,7 +249,7 @@ to stderr, so a redirected `notification list` captures only rows.
 `halo account profile` summarizes by default because the payload carries your
 email addresses, avatar URL, and referral link; `beacon list`, `account
 subscription`, `notification inbox`, and `correction config` print in full
-because nothing in their supported payloads needs hiding.
+because nothing in their returned payloads needs hiding.
 
 `halo collar list`, `halo pet list`, `halo fence list`, and `halo account map`
 print privacy-reduced summaries rather than full Wi-Fi, coordinate, and
@@ -272,12 +273,12 @@ response returns `pets` (each with its collar embedded), `geoFencesInfo`, and
 `corrections`, so prefer it over several separate calls when polling. The apps
 always send a viewport centre, but Halo returns the whole account without one,
 so the coordinates are optional here and on `HaloClient.account_map`. The
-summary counts `corrections` rather than redacting them, because no capture has
-ever shown that list populated and there is no verified shape to trust.
+summary counts `corrections` rather than redacting them because the records have
+no stable privacy-safe summary shape.
 
 ## Stream live events
 
-The CLI can keep either supported SignalR hub open and print one compact JSON
+The CLI can keep either SignalR hub open and print one compact JSON
 object per line until `Ctrl-C`:
 
 ```bash
@@ -355,8 +356,8 @@ Supported upstream routes:
 | PUT | `/push-notification/subscribe` | `subscribe_push_notifications()` |
 | PUT | `/push-notification/unsubscribe-device` | `unsubscribe_push_device()` |
 
-Paths are sent exactly as supported, which is why some carry a trailing slash and
-others do not. `/walk/my` pages with `page`/`pageSize` while
+Paths use the route-specific spelling and trailing slashes expected by the
+upstream API. `/walk/my` pages with `page`/`pageSize` while
 `/notification/my/query` pages with `Page`/`PageSize`; that inconsistency is
 Halo's, not a typo.
 
@@ -455,11 +456,10 @@ devices. `Platform` follows the OAuth profile, while the model, manufacturer,
 and version describe the machine actually running this client rather than an
 invented handset; `register_mobile_device()` takes overrides for all of them.
 
-Until you register, corrections fall back to the constant `DEFAULT_MOBILE_ID = 2`
-that this client shipped with. That constant was a guess: the one captured
-registration returned `3`, and the value is per-installation, so the fallback is
-almost certainly not the id Halo associates with you. Corrections have been
-accepted anyway, so what Halo does with the field is unknown.
+Until you register, corrections fall back to `DEFAULT_MOBILE_ID = 2`. The value
+is per installation, so the fallback is unlikely to be the id Halo associates
+with you. Register the device before sending corrections; the exact server-side
+role of this field is unknown.
 
 ### Endpoints handling sensitive data
 
@@ -480,9 +480,9 @@ without extra hardware. See the [Roadmap](#roadmap) for what is missing and why.
 
 ## Send a correction
 
-Supported correction types:
+Correction types:
 
-| API value | Supported expiry |
+| API value | Expiry |
 | --- | ---: |
 | `Warning` | 4 seconds |
 | `FirstTime` | 4 seconds |
@@ -559,13 +559,13 @@ with HaloClient() as halo:
     )
 ```
 
-Read responses remain dictionaries because the upstream schema can
-change independently of this package.
+Read responses remain dictionaries because the upstream schema can change
+independently of this package.
 
 ## Live events with SignalR
 
 `HaloSignalRClient` is an async, receive-only companion to `HaloClient`. It
-performs the captured Halo-to-Azure two-stage negotiation, completes the JSON
+performs Halo's two-stage Azure negotiation, completes the JSON
 SignalR handshake, sends keepalives, and repeats the complete negotiation after
 a transient disconnect so that neither the Halo access token nor Azure's
 short-lived connection token is reused incorrectly.
@@ -588,7 +588,7 @@ asyncio.run(follow())
 
 Telemetry events arrive as `SignalREvent` objects. `target` is the server method
 (`HandleIoTTelemetry`, `HandleDataStateChanged`, or
-`HandleCollarDataSynchronized` in supported API), `arguments` and `raw`
+`HandleCollarDataSynchronized`), `arguments` and `raw`
 preserve Halo's complete payload, and the `pet_id` and `sequence_code`
 properties pull out the two common routing fields without hiding anything.
 Pass `SignalRHub.NOTIFICATIONS` to connect to `NotificationHub`.
@@ -601,15 +601,13 @@ client to consume the other hub concurrently.
 
 ## Roadmap
 
-Nothing here is implemented. Everything in the first two groups is unspecified from
-API behavior or response payloads currently support, not from documentation, so treat
-the request shapes as unknown until support is added.
+Nothing here is implemented. The request shapes for these features are not part
+of this client's supported API.
 
 ### Blocked on hardware or conditions we could not reproduce
 
-- **Walk recording.** `GET /walk/my` is covered, but starting and finishing a walk
-  needs a working Bluetooth link to the collar; our attempt never connected, so no
-  walk creation was ever produced.
+- **Walk recording.** `GET /walk/my` is covered, but starting and finishing a
+  walk requires a working Bluetooth link to the collar.
 - **Beacon mutations.** `GET /beacon/my` returns `availableRanges`, `beacons`, and
   `defaultRange`, but with no beacon hardware on the account there was nothing to
   add, rename, or remove.
@@ -618,10 +616,10 @@ the request shapes as unknown until support is added.
   `isCollarBindingToPetSynchronized` and `isCollarEverAssigned`, but our second pet
   had no collar to attach.
 
-### Implied by returned payloads, without write support
+### Additional write operations
 
-These fields come back on `GET`s the client already supports, which means an
-endpoint exists to set them:
+These fields are returned by supported reads, but their write operations are
+not implemented:
 
 - **Pet mode.** `mode.fencesOn` / `mode.beaconsOn`, alongside `desiredMode` and
   `desiredModeUpdated`. Turning containment off remotely is safety-relevant and
@@ -659,8 +657,8 @@ endpoint exists to set them:
 - Pagination helpers that iterate `walks()` and `notifications()` instead of
   making callers track `pageNumber` against `totalNumberOfPages`.
 - Typed models. Responses are deliberately plain dictionaries today because the
-  schema is undocumented and can change without notice; typing them is
-  worthwhile once the shapes prove stable.
+  upstream schema can change without notice; typing them is worthwhile once the
+  shapes prove stable.
 - An async client, since the sync one is a thin wrapper over HTTPX.
 - A retry policy for reads. The no-retry rule exists to protect corrections and
   other mutations; idempotent `GET`s could safely back off and retry.

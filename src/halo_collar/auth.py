@@ -1,4 +1,4 @@
-"""OAuth 2.0 login and refresh-token support for supported Halo mobile clients."""
+"""OAuth 2.0 login and refresh-token support for Halo mobile profiles."""
 
 from __future__ import annotations
 
@@ -23,15 +23,15 @@ AUTHORIZE_PATH = "/connect/authorize"
 TOKEN_PATH = "/connect/token"
 REDIRECT_URI = "haloapp://callback"
 SCOPE = "openid email offline_access api.dogpark"
-# These are application credentials distributed inside the official mobile apps,
-# not per-user secrets. Account passwords and issued OAuth tokens remain private.
+# These are application credentials, not per-user secrets. Account passwords
+# and issued OAuth tokens remain private.
 IOS_CLIENT_SECRET = "ZfmP^5M2M$98R8A%"
 ANDROID_CLIENT_SECRET = "34fcPOX6rChDi83@"
 
 
 @dataclass(frozen=True, slots=True)
 class OAuthClientProfile:
-    """Supported metadata that must stay paired with a mobile OAuth session."""
+    """Metadata that must stay paired with a mobile OAuth session."""
 
     name: str
     client_id: str
@@ -110,7 +110,7 @@ def _pkce_challenge(verifier: str) -> str:
 
 
 class HaloOAuth:
-    """Authenticate with one supported Halo mobile OAuth client."""
+    """Authenticate with one Halo mobile OAuth profile."""
 
     def __init__(
         self,
@@ -139,8 +139,7 @@ class HaloOAuth:
         self.close()
 
     def begin_login(self) -> AuthorizationFlow:
-        # The iOS profile uses a 32-byte verifier (43 base64url chars).
-        # Although PKCE permits longer values, match Halo's supported model exactly.
+        # Use a 32-byte verifier (43 base64url characters) for this PKCE flow.
         verifier = _urlsafe_random(32)
         state = _urlsafe_random(32)
         nonce = _urlsafe_random(32)
@@ -209,7 +208,7 @@ class HaloOAuth:
         """Exchange account credentials without retaining them."""
 
         if self.profile.client_id != ANDROID_PROFILE.client_id:
-            raise ValueError("The supported Halo password grant requires the Android profile.")
+            raise ValueError("The Halo password grant requires the Android profile.")
         username = username.strip()
         if not username:
             raise ValueError("Halo account email is required.")

@@ -409,7 +409,7 @@ def _stub_client(
     return client
 
 
-def test_account_map_sends_the_captured_viewport_parameters(tmp_path) -> None:
+def test_account_map_sends_the_expected_viewport_parameters(tmp_path) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -636,7 +636,7 @@ def test_find_collar_rejects_path_injection(tmp_path) -> None:
         client.find_collar("../pet/x/run-instant-correction")
 
 
-def test_push_subscription_matches_the_captured_bodies(tmp_path) -> None:
+def test_push_subscription_matches_the_expected_bodies(tmp_path) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -681,7 +681,7 @@ def test_pets_lists_pets_that_have_no_collar(tmp_path) -> None:
     assert [pet["name"] for pet in client.pets()] == ["Alpha", "Bravo"]
 
 
-def test_geo_fence_add_matches_the_captured_body(tmp_path) -> None:
+def test_geo_fence_add_matches_the_expected_body(tmp_path) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -814,7 +814,7 @@ def test_notification_status_requires_ids_and_marks_read(tmp_path) -> None:
         client.set_notification_status([])
 
 
-def test_parcel_lookup_builds_the_captured_point_literal(tmp_path) -> None:
+def test_parcel_lookup_builds_the_expected_point_literal(tmp_path) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -841,7 +841,7 @@ def test_course_launch_link_returns_the_external_url(tmp_path) -> None:
     assert client.training_course_link("2024-curriculum-update-v1b509", "CollarFitting") == launch
 
 
-def test_add_pet_matches_the_captured_body(tmp_path) -> None:
+def test_add_pet_matches_the_expected_body(tmp_path) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
