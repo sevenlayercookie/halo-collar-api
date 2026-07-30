@@ -1,7 +1,17 @@
 # Unofficial Halo Collar Python client
 
-This project is a conservative Python client for REST API supported from the
-Halo Collar iOS and Android apps. It is not affiliated with or supported by Halo.
+> [!IMPORTANT]
+> This is an unofficial project. It is not affiliated with,
+> endorsed by, or supported by Halo Collar.
+
+This project is a conservative Python client for Halo Collar REST and SignalR APIs.
+
+## Documentation
+
+- [Detailed Python and upstream API reference](API.md)
+- [CLI usage](#using-the-cli)
+- [Safety and privacy](#safety-and-privacy)
+- [Roadmap](#roadmap)
 
 Implemented, supported functionality:
 
