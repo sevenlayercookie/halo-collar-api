@@ -242,6 +242,56 @@ class HaloClient:
             raise HaloAPIError("Halo returned an unexpected pet list.")
         return value
 
+    def set_pet_fences_enabled(
+        self,
+        pet_id: str,
+        enabled: bool,
+    ) -> dict[str, Any]:
+        """Set the requested containment-fence mode for one pet.
+
+        Halo reports the accepted target under ``desiredMode`` and the collar's
+        last reported state under ``telemetry.mode``. Those values may differ
+        while the request is waiting to reach or be confirmed by the collar.
+        Disabling fences is safety-relevant, so verify the reported state before
+        relying on it. Extra response fields are preserved without interpretation.
+        """
+
+        return self._put_object(
+            f"/pet/{_identifier(pet_id)}/instant-mode",
+            json_body={
+                "ModePatch": {
+                    "FencesOn": _required_boolean(enabled, "enabled"),
+                    "BeaconsOn": None,
+                }
+            },
+        )
+
+    def set_pet_beacons_assigned(
+        self,
+        pet_id: str,
+        assigned: bool,
+    ) -> dict[str, Any] | None:
+        """Enable or disable beacon assignment for one pet.
+
+        Beacon assignment uses a separate route from containment mode. The
+        response shape has not been established, so an object is returned
+        unchanged when present and an empty successful response returns
+        ``None``.
+        """
+
+        path = f"/beacon/set-is-assigned/{_identifier(pet_id)}"
+        response = self._request(
+            "PUT",
+            path,
+            json_body={"IsAssigned": _required_boolean(assigned, "assigned")},
+        )
+        if not response.content:
+            return None
+        value = self._decode_json(response)
+        if not isinstance(value, dict):
+            raise HaloAPIError(f"Halo returned an unexpected response for {path}.")
+        return value
+
     def account_map(
         self,
         latitude: float | None = None,
@@ -966,6 +1016,12 @@ def _identifier(value: str) -> str:
 def _positive(value: int, name: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise ValueError(f"{name} must be an integer of at least 1.")
+    return value
+
+
+def _required_boolean(value: bool, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean.")
     return value
 
 

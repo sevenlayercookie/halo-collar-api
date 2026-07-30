@@ -22,7 +22,7 @@ Implemented functionality:
 - Public application configuration
 - Account collars and connectivity
 - Pet listing (including collarless pets), details, creation, editing, and
-  optional telemetry refresh
+  optional telemetry refresh, plus containment and beacon mode changes
 - The aggregate map view, geofence create/rename/move/delete, and safe-zone preview
 - User profile, beacons, subscription, and in-app notifications
 - Walk history, notification history, and marking notifications read
@@ -34,8 +34,8 @@ Implemented functionality:
 - Async SignalR streams for live telemetry, data-state, collar-sync, and
   notification-hub events
 
-BLE rolling codes, DGNSS forwarding, walk recording, beacon mutations, and
-collar provisioning are not implemented.
+BLE rolling codes, DGNSS forwarding, walk recording, beacon creation/editing,
+and collar-to-pet assignment are not implemented.
 
 ## Safety and privacy
 
@@ -332,6 +332,23 @@ halo collar bind PRINTED_SERIAL ENCRYPTED_SERIAL
 The bind command asks you to type the printed serial before changing the
 account. Pass `--yes` for an intentional non-interactive call.
 
+## Pet containment and beacon modes
+
+Containment fences and beacon assignment use separate operations:
+
+```python
+mode = client.set_pet_fences_enabled(pet_id, False)
+client.set_pet_beacons_assigned(pet_id, True)
+```
+
+For containment responses, `desiredMode` is the target accepted by the cloud,
+while `telemetry.mode` is the last state reported by the collar. If
+`desiredMode.fencesOn` differs from `telemetry.mode.fencesOn`, the requested
+change has not yet been confirmed as applied. Responses remain dictionaries so
+additional server fields are preserved without assigning them speculative
+meaning. Turning fences off can disable physical containment; verify the
+collar-reported mode before relying on the change.
+
 ## Endpoint coverage
 
 Supported upstream routes:
@@ -363,6 +380,8 @@ Supported upstream routes:
 | POST | `/pet/add` | `add_pet()` |
 | PUT | `/pet/{id}` | `update_pet()` |
 | DELETE | `/pet/{id}` | `delete_pet()` |
+| PUT | `/pet/{id}/instant-mode` | `set_pet_fences_enabled()` |
+| PUT | `/beacon/set-is-assigned/{id}` | `set_pet_beacons_assigned()` |
 | PUT | `/pet/check-name-uniqueness` | `pet_name_is_available()` |
 | PUT | `/notification/status` | `set_notification_status()` |
 | POST | `/geo-fence/safe-zones` | `geo_fence_safe_zones()` |
@@ -629,9 +648,8 @@ of this client's supported API.
 
 - **Walk recording.** `GET /walk/my` is covered, but starting and finishing a
   walk requires a working Bluetooth link to the collar.
-- **Beacon mutations.** `GET /beacon/my` returns `availableRanges`, `beacons`, and
-  `defaultRange`, but with no beacon hardware on the account there was nothing to
-  add, rename, or remove.
+- **Beacon management.** Per-pet assignment is covered, but with no beacon
+  hardware on the account there was nothing to add, rename, or remove.
 - **Collar provisioning.** Pairing a collar, binding it to a pet, and unbinding or
   deleting one. The app exposes all of these, and a pet carries
   `isCollarBindingToPetSynchronized` and `isCollarEverAssigned`, but our second pet
@@ -642,9 +660,6 @@ of this client's supported API.
 These fields are returned by supported reads, but their write operations are
 not implemented:
 
-- **Pet mode.** `mode.fencesOn` / `mode.beaconsOn`, alongside `desiredMode` and
-  `desiredModeUpdated`. Turning containment off remotely is safety-relevant and
-  deserves the same care as a correction.
 - **Fence assignment.** `currentGeoFenceId` selects which fence applies to a pet;
   fence CRUD is covered but choosing the active one is not.
 - **Correction rule editing.** `GET /pet/{id}/correction-rules` and

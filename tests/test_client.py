@@ -697,6 +697,78 @@ def test_collar_binding_requires_serial_values(tmp_path, method, args) -> None:
         getattr(client, method)(*args)
 
 
+def test_pet_mode_routes_keep_fences_and_beacons_separate(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/pet/pet-1/instant-mode":
+            return httpx.Response(
+                200,
+                json={
+                    "desiredMode": {"fencesOn": False, "beaconsOn": True},
+                    "telemetry": {
+                        "mode": {"fencesOn": True, "beaconsOn": True},
+                    },
+                },
+            )
+        if request.url.path == "/beacon/set-is-assigned/pet-1":
+            return httpx.Response(200, json={"isAssigned": False})
+        raise AssertionError(request.url)
+
+    client = _stub_client(tmp_path, handler)
+    mode = client.set_pet_fences_enabled("pet-1", False)
+    beacon = client.set_pet_beacons_assigned("pet-1", False)
+
+    assert mode["desiredMode"]["fencesOn"] is False
+    assert mode["telemetry"]["mode"]["fencesOn"] is True
+    assert beacon == {"isAssigned": False}
+    assert [request.method for request in requests] == ["PUT", "PUT"]
+    assert [request.url.path for request in requests] == [
+        "/pet/pet-1/instant-mode",
+        "/beacon/set-is-assigned/pet-1",
+    ]
+    assert json.loads(requests[0].content) == {
+        "ModePatch": {"FencesOn": False, "BeaconsOn": None}
+    }
+    assert json.loads(requests[1].content) == {"IsAssigned": False}
+    assert requests[0].headers["Halo-Amplitude-SessionId"] == "1700000000000"
+    assert requests[1].headers["Halo-Amplitude-SessionId"] == "1700000000000"
+
+
+def test_beacon_assignment_tolerates_an_empty_success_response(tmp_path) -> None:
+    client = _stub_client(tmp_path, lambda _: httpx.Response(204))
+
+    assert client.set_pet_beacons_assigned("pet-1", True) is None
+
+
+@pytest.mark.parametrize(
+    ("method", "value"),
+    [
+        ("set_pet_fences_enabled", 1),
+        ("set_pet_fences_enabled", "false"),
+        ("set_pet_beacons_assigned", 0),
+        ("set_pet_beacons_assigned", None),
+    ],
+)
+def test_pet_mode_routes_require_real_booleans(tmp_path, method, value) -> None:
+    client = _stub_client(tmp_path, lambda _: pytest.fail("request should not be sent"))
+
+    with pytest.raises(ValueError, match="boolean"):
+        getattr(client, method)("pet-1", value)
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["set_pet_fences_enabled", "set_pet_beacons_assigned"],
+)
+def test_pet_mode_routes_reject_path_injection(tmp_path, method) -> None:
+    client = _stub_client(tmp_path, lambda _: pytest.fail("request should not be sent"))
+
+    with pytest.raises(ValueError):
+        getattr(client, method)("../pet-2", True)
+
+
 def test_push_subscription_matches_the_expected_bodies(tmp_path) -> None:
     requests: list[httpx.Request] = []
 

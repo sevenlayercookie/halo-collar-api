@@ -204,6 +204,8 @@ The client does not automatically retry other network failures.
 | `collars()` | `list[dict]` | Collars on the account, including connectivity and telemetry. |
 | `pets()` | `list[dict]` | All pets, including pets without collars. |
 | `pet(pet_id, *, refresh_telemetry=False)` | `dict` | One pet, optionally requesting fresher collar telemetry. |
+| `set_pet_fences_enabled(pet_id, enabled)` | `dict` | Set the desired containment mode and return desired plus last-reported collar state. |
+| `set_pet_beacons_assigned(pet_id, assigned)` | `dict \| None` | Change beacon assignment through its separate route; returns the response object or `None` for an empty success. |
 | `account_map(latitude=None, longitude=None, *, refresh_telemetry=False, max_corrections_count=20)` | `dict` | Aggregate pets, collars, geofences, and recent corrections. Pass both coordinates or neither. |
 | `geofences()` | `list[dict]` | Geofences extracted locally from `account_map()`. |
 | `walks(*, page=1, page_size=30)` | `dict` | One page of recorded walks. |
@@ -249,9 +251,19 @@ public-record information about real people. Treat all three accordingly.
 | `add_pet(*, name, color_hex, breed, birthday, weight_kg)` | `dict` | Create a pet without a collar. |
 | `update_pet(pet_id, *, name, color_hex, breed, birthday, weight_kg)` | `dict` | Fully replace a pet profile. All fields are required. |
 | `delete_pet(pet_id)` | `None` | Permanently delete a pet and its Halo history. |
+| `set_pet_fences_enabled(pet_id, enabled)` | `dict` | Set containment on or off without changing beacon assignment. |
+| `set_pet_beacons_assigned(pet_id, assigned)` | `dict \| None` | Enable or disable beacon assignment without changing containment mode. |
 
 `birthday` accepts an ISO date string or `datetime`. `color_hex` should be one
 of the values returned by `pet_colors()`.
+
+Containment requests send `ModePatch.FencesOn` and leave
+`ModePatch.BeaconsOn` null. In the response, `desiredMode` is the target the
+cloud accepted; `telemetry.mode` is the collar's last reported state. A
+difference between those values means the change has not yet been confirmed as
+applied by the collar. The client preserves any additional response members
+without interpreting them. Disabling fences can remove physical containment;
+verify `telemetry.mode` before relying on the change.
 
 ### Geofence methods
 
@@ -467,6 +479,8 @@ an HTTP server of its own.
 | `POST` | `/pet/add` | `add_pet()` |
 | `PUT` | `/pet/{id}` | `update_pet()` |
 | `DELETE` | `/pet/{id}` | `delete_pet()` |
+| `PUT` | `/pet/{id}/instant-mode` | `set_pet_fences_enabled()` |
+| `PUT` | `/beacon/set-is-assigned/{id}` | `set_pet_beacons_assigned()` |
 | `PUT` | `/pet/check-name-uniqueness` | `pet_name_is_available()` |
 | `PUT` | `/notification/status` | `set_notification_status()` |
 | `POST` | `/geo-fence/safe-zones` | `geo_fence_safe_zones()` |
