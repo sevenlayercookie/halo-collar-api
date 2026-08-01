@@ -10,14 +10,21 @@ import pytest
 from halo_collar import (
     ANDROID_CLIENT_SECRET,
     IOS_CLIENT_SECRET,
+    BeaconActionType,
+    BeaconCorrectionEscalationType,
+    BeaconModelType,
     CorrectionOutcomeUnknownError,
+    CorrectionRuleKindType,
+    CorrectionRuleUpdate,
     CorrectionType,
+    FirmwareUpdateStatus,
     HaloAPIError,
     HaloClient,
     LoginRequiredError,
     StaleCommandNumberError,
     StateStore,
     TokenSet,
+    WalkStopOption,
 )
 
 
@@ -34,7 +41,7 @@ def test_correction_uses_server_time_and_never_retries(tmp_path) -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        if request.url.path == "/collar/my/":
+        if request.url.path == "/collar/my":
             return httpx.Response(
                 200,
                 json=[
@@ -155,6 +162,167 @@ def test_transport_error_has_unknown_outcome_and_reserved_counter(tmp_path) -> N
     assert store.reserve_command_number("pet-1") == 6
 
 
+def test_update_correction_rules_sends_an_item_level_pascal_case_batch(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "correctionRules": [{"id": "rule-sound", "kindType": "sound"}],
+                "areCorrectionRulesDefault": False,
+                "lastCorrectionRulesUpdated": "2026-07-30T18:42:00Z",
+            },
+        )
+
+    client = _stub_client(tmp_path, handler)
+    updated = client.update_correction_rules(
+        [
+            CorrectionRuleUpdate(
+                "rule-sound",
+                CorrectionRuleKindType.SOUND,
+                level=3,
+                sound_id="sound-1",
+            ),
+            CorrectionRuleUpdate(
+                "rule-vibration",
+                "Vibration",
+                vibration_id="vibration-1",
+            ),
+            CorrectionRuleUpdate("rule-shock", "Shock", level=4),
+        ]
+    )
+
+    assert updated["lastCorrectionRulesUpdated"] == "2026-07-30T18:42:00Z"
+    assert requests[0].method == "PUT"
+    assert requests[0].url.path == "/correction-rule"
+    assert json.loads(requests[0].content) == {
+        "Items": [
+            {
+                "CorrectionRuleId": "rule-sound",
+                "KindType": "Sound",
+                "Level": 3,
+                "SoundId": "sound-1",
+                "VibrationId": None,
+            },
+            {
+                "CorrectionRuleId": "rule-vibration",
+                "KindType": "Vibration",
+                "Level": None,
+                "SoundId": None,
+                "VibrationId": "vibration-1",
+            },
+            {
+                "CorrectionRuleId": "rule-shock",
+                "KindType": "Shock",
+                "Level": 4,
+                "SoundId": None,
+                "VibrationId": None,
+            },
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        [],
+        [CorrectionRuleUpdate("rule-1", "Sound", level=3)],
+        [CorrectionRuleUpdate("rule-1", "Vibration", level=1, vibration_id="vibration-1")],
+        [CorrectionRuleUpdate("rule-1", "Shock", sound_id="sound-1")],
+        [
+            CorrectionRuleUpdate("rule-1", "Shock", level=1),
+            CorrectionRuleUpdate("rule-1", "Shock", level=2),
+        ],
+    ],
+)
+def test_update_correction_rules_rejects_unsafe_or_ambiguous_items(tmp_path, items) -> None:
+    client = _stub_client(tmp_path, lambda _: pytest.fail("request should not be sent"))
+
+    with pytest.raises(ValueError):
+        client.update_correction_rules(items)
+
+
+def test_collar_test_uses_server_time_counter_and_modality_fields(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/collar/my":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "petInfo": {"id": "pet-1"},
+                        "telemetry": {"wiFi": {"status": "socketconnected"}},
+                    }
+                ],
+                headers={"Halo-ParallelCall-Version": "15"},
+            )
+        if request.url.path == "/system/server-date-time":
+            return httpx.Response(200, json="2026-07-30T18:42:00Z")
+        if request.url.path == "/correction-rule/test-on-collar":
+            return httpx.Response(
+                200,
+                json={"result": "success", "currentCommandNumber": 456},
+            )
+        raise AssertionError(request.url)
+
+    client = _stub_client(tmp_path, handler)
+    result = client.test_correction_on_collar(
+        "pet-1",
+        CorrectionRuleKindType.SOUND,
+        sound_id="sound-1",
+        sound_intensity_level=3,
+        command_number=456,
+    )
+
+    assert result == {"result": "success", "currentCommandNumber": 456}
+    request = requests[-1]
+    assert request.method == "PUT"
+    assert request.url.path == "/correction-rule/test-on-collar"
+    assert request.headers["Halo-ParallelCall-Version"] == "15"
+    assert json.loads(request.content) == {
+        "MobileId": 2,
+        "CommandNumber": 456,
+        "PetId": "pet-1",
+        "KindType": "Sound",
+        "SoundId": "sound-1",
+        "VibrationId": None,
+        "SoundIntensityLevel": 3,
+        "ShockIntensityLevel": None,
+        "ExpirationDate": "2026-07-30T18:42:30.000Z",
+    }
+
+
+def test_collar_test_transport_failure_is_not_retried(tmp_path) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if request.url.path == "/system/server-date-time":
+            return httpx.Response(
+                200,
+                json="2026-07-30T18:42:00Z",
+                headers={"Halo-ParallelCall-Version": "27"},
+            )
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    client = _stub_client(tmp_path, handler)
+    with pytest.raises(CorrectionOutcomeUnknownError):
+        client.test_correction_on_collar(
+            "pet-1",
+            "Shock",
+            shock_intensity_level=1,
+            command_number=10,
+            require_online=False,
+        )
+    assert calls == 2
+    assert client.store.reserve_command_number("pet-1") == 11
+
+
 def test_401_reauthenticates_and_retries_once(tmp_path) -> None:
     requests: list[httpx.Request] = []
 
@@ -169,7 +337,7 @@ def test_401_reauthenticates_and_retries_once(tmp_path) -> None:
                     "expires_in": 7200,
                 },
             )
-        if len([item for item in requests if item.url.path == "/collar/my/"]) == 1:
+        if len([item for item in requests if item.url.path == "/collar/my"]) == 1:
             return httpx.Response(401)
         return httpx.Response(200, json=[])
 
@@ -184,9 +352,9 @@ def test_401_reauthenticates_and_retries_once(tmp_path) -> None:
     )
     assert client.collars() == []
     assert [request.url.path for request in requests] == [
-        "/collar/my/",
+        "/collar/my",
         "/connect/token",
-        "/collar/my/",
+        "/collar/my",
     ]
 
 
@@ -454,6 +622,90 @@ def test_geofences_read_the_map_without_a_viewport(tmp_path) -> None:
     assert query == {"RefreshTelemetry": ["False"], "MaxCorrectionsCount": ["20"]}
 
 
+def test_account_map_preserves_reported_active_fence_and_assignment_set(tmp_path) -> None:
+    payload = {
+        "pets": [
+            {
+                "id": "pet-1",
+                "currentGeoFenceId": "fence-1",
+                "telemetry": {"geoFence": {"id": "fence-1", "name": "Home"}},
+                "fencesState": "allapplied",
+                "isFencesSynchronized": True,
+            },
+            {
+                "id": "pet-2",
+                "currentGeoFenceId": None,
+                "telemetry": None,
+            },
+        ],
+        "geoFencesInfo": {
+            "geoFencesToDisplay": [
+                {
+                    "id": "fence-1",
+                    "petsSync": [
+                        {"petId": "pet-1", "isAssigned": True, "status": "completed"},
+                        {"petId": "pet-2", "isAssigned": True, "status": "skipped"},
+                    ],
+                },
+                {
+                    "id": "fence-2",
+                    "petsSync": [
+                        {"petId": "pet-1", "isAssigned": True, "status": "pending"},
+                    ],
+                },
+            ],
+            "geoFencesTotalCount": 2,
+        },
+        "corrections": [],
+    }
+    client = _stub_client(tmp_path, lambda _: httpx.Response(200, json=payload))
+
+    result = client.account_map()
+
+    assert result["pets"][0]["currentGeoFenceId"] == "fence-1"
+    assert result["pets"][1]["currentGeoFenceId"] is None
+    assert [
+        fence["petsSync"][0]["status"]
+        for fence in result["geoFencesInfo"]["geoFencesToDisplay"]
+    ] == ["completed", "pending"]
+
+
+def test_geo_fence_pet_sync_returns_automatic_distribution_state(tmp_path) -> None:
+    sync = [
+        {"petId": "pet-1", "isAssigned": True, "status": "completed"},
+        {"petId": "pet-2", "isAssigned": True, "status": "skipped"},
+    ]
+    payload = {
+        "geoFencesInfo": {
+            "geoFencesToDisplay": [
+                {"id": "fence-1", "petsSync": []},
+                {"id": "fence-2", "petsSync": sync},
+            ]
+        }
+    }
+    client = _stub_client(tmp_path, lambda _: httpx.Response(200, json=payload))
+
+    assert client.geo_fence_pet_sync("fence-2") == sync
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "geoFencesInfo": {
+                "geoFencesToDisplay": [{"id": "fence-1", "petsSync": None}]
+            }
+        },
+        {"geoFencesInfo": {"geoFencesToDisplay": [{"id": "another-fence", "petsSync": []}]}},
+    ],
+)
+def test_geo_fence_pet_sync_rejects_missing_or_malformed_state(tmp_path, payload) -> None:
+    client = _stub_client(tmp_path, lambda _: httpx.Response(200, json=payload))
+
+    with pytest.raises(HaloAPIError):
+        client.geo_fence_pet_sync("fence-1")
+
+
 def test_registering_a_device_stores_the_mobile_id_corrections_carry(tmp_path) -> None:
     requests: list[httpx.Request] = []
 
@@ -609,6 +861,170 @@ def test_paged_endpoints_use_halos_inconsistent_parameter_casing(tmp_path) -> No
     assert parse_qs(requests[1].url.query.decode()) == {"Page": ["3"], "PageSize": ["5"]}
 
 
+def test_walk_summary_uses_the_single_walk_route(tmp_path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/walk/walk-1/summary"
+        return httpx.Response(
+            200,
+            json={
+                "id": "walk-1",
+                "startTrigger": "mobile",
+                "endedAt": "2026-07-30T18:41:12Z",
+                "trailThumbnailImageUrl": None,
+            },
+        )
+
+    client = _stub_client(tmp_path, handler)
+
+    assert client.walk_summary("walk-1")["startTrigger"] == "mobile"
+
+
+def test_walk_pause_and_stop_send_per_collar_commands(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"result": "success"})
+
+    client = _stub_client(tmp_path, handler)
+
+    assert client.set_walk_paused("walk-1", "collar-1", True) == {"result": "success"}
+    assert client.stop_walk(
+        "walk-1",
+        "collar-1",
+        stop_option=WalkStopOption.FORCE_SET_FENCES_ON,
+    ) == {"result": "success"}
+
+    assert [request.url.path for request in requests] == [
+        "/walk/walk-1/set-is-paused",
+        "/walk/walk-1/stop",
+    ]
+    assert json.loads(requests[0].content) == {
+        "CollarId": "collar-1",
+        "SetWalkIsPaused": True,
+    }
+    assert json.loads(requests[1].content) == {
+        "CollarId": "collar-1",
+        "StopOption": "ForceSetFencesOn",
+    }
+
+
+def test_walk_command_results_are_returned_for_caller_interpretation(tmp_path) -> None:
+    client = _stub_client(
+        tmp_path,
+        lambda _: httpx.Response(200, json={"result": "walkIdMismatch"}),
+    )
+
+    assert client.set_walk_paused("walk-1", "collar-1", False) == {
+        "result": "walkIdMismatch"
+    }
+
+
+def test_mark_walk_ended_sends_summary_without_raw_points(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    pets = [
+        {
+            "Id": "pet-1",
+            "CollarId": "collar-1",
+            "WalkedDurationInSeconds": 1815,
+            "WalkedDistanceInMeters": 2431.7,
+            "FeedbacksCount": 2,
+            "Timestamp": "2026-07-30T18:41:10Z",
+        }
+    ]
+    user = {
+        "TotalDuration": "00:31:12",
+        "WalkedDuration": "00:30:15",
+        "WalkedDistanceInMeters": 2388.4,
+    }
+    client = _stub_client(tmp_path, handler)
+
+    assert (
+        client.mark_walk_ended(
+            "walk-1",
+            started_at=datetime(2026, 7, 30, 18, 10, tzinfo=timezone.utc),
+            ended_at="2026-07-30T18:41:12Z",
+            pets=pets,
+            user=user,
+            location_name="Rochester, Minnesota",
+        )
+        is None
+    )
+
+    assert requests[0].url.path == "/walk/walk-1/mark-ended"
+    assert json.loads(requests[0].content) == {
+        "StartedAt": "2026-07-30T18:10:00.000Z",
+        "EndedAt": "2026-07-30T18:41:12Z",
+        "Pets": pets,
+        "User": user,
+        "LocationName": "Rochester, Minnesota",
+    }
+
+
+def test_walk_image_uploads_use_the_observed_multipart_fields(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200)
+
+    client = _stub_client(tmp_path, handler)
+    client.upload_walk_trail_thumbnail(
+        "walk-1",
+        b"thumbnail-bytes",
+        filename="overview.jpg",
+        content_type="image/jpeg",
+    )
+    client.upload_walk_pet_trail_image("walk-1", "pet-1", b"pet-trail-bytes")
+
+    assert [request.url.path for request in requests] == [
+        "/walk/walk-1/trail-thumbnail",
+        "/walk/walk-1/pet/pet-1/trail-image",
+    ]
+    assert all(
+        request.headers["Content-Type"].startswith("multipart/form-data; boundary=")
+        for request in requests
+    )
+    assert b'name="trail-thumbnail"' in requests[0].content
+    assert b'filename="overview.jpg"' in requests[0].content
+    assert b"thumbnail-bytes" in requests[0].content
+    assert b'name="trail-image"' in requests[1].content
+    assert b'filename="trail-image.png"' in requests[1].content
+    assert b"pet-trail-bytes" in requests[1].content
+
+
+@pytest.mark.parametrize(
+    ("call", "message"),
+    [
+        (lambda client: client.set_walk_paused("walk-1", "collar-1", 1), "boolean"),
+        (lambda client: client.stop_walk("walk-1", "collar-1", stop_option="bad"), "stop option"),
+        (
+            lambda client: client.mark_walk_ended(
+                "walk-1",
+                started_at="2026-07-30T18:10:00Z",
+                ended_at="2026-07-30T18:41:12Z",
+                pets=[],
+                user={},
+                location_name=None,
+            ),
+            "pets",
+        ),
+        (lambda client: client.upload_walk_trail_thumbnail("walk-1", b""), "bytes"),
+    ],
+)
+def test_walk_mutations_validate_local_inputs(tmp_path, call, message) -> None:
+    client = _stub_client(tmp_path, lambda _: pytest.fail("request should not be sent"))
+
+    with pytest.raises(ValueError, match=message):
+        call(client)
+
+
 @pytest.mark.parametrize("bad", [0, -1, True])
 def test_paging_rejects_values_halo_would_not_accept(tmp_path, bad) -> None:
     client = _stub_client(tmp_path, lambda _: httpx.Response(200, json={}))
@@ -697,6 +1113,139 @@ def test_collar_binding_requires_serial_values(tmp_path, method, args) -> None:
         getattr(client, method)(*args)
 
 
+def test_collar_pet_provisioning_routes_and_snapshot_checks(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET" and request.url.path == "/collar/collar-1":
+            return httpx.Response(
+                200,
+                json={"id": "collar-1", "petInfo": {"id": "pet-1", "name": "Scout"}},
+            )
+        if request.method == "GET" and request.url.path == "/pet/pet-1":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "pet-1",
+                    "collarInfo": {"id": "collar-1"},
+                    "isCollarBindingToPetSynchronized": True,
+                },
+            )
+        return httpx.Response(204)
+
+    client = _stub_client(tmp_path, handler)
+    client.bind_collar_to_pet("pet-1", "collar-1")
+    pet = client.pet("pet-1", refresh_telemetry=True)
+    collar = client.collar("collar-1")
+    client.unbind_collar_from_pet("pet-1")
+    client.unbind_collar_from_user("collar-1")
+
+    assert client.pet_collar_binding_is_synchronized(pet, "collar-1")
+    assert not client.pet_collar_binding_is_synchronized(pet, "collar-2")
+    assert client.collar_is_assigned_to_pet(collar, "pet-1")
+    assert not client.collar_is_assigned_to_pet(collar, "pet-2")
+    assert [(request.method, request.url.path) for request in requests] == [
+        ("PUT", "/pet/pet-1/bind-collar"),
+        ("GET", "/pet/pet-1"),
+        ("GET", "/collar/collar-1"),
+        ("PUT", "/pet/pet-1/unbind-collar"),
+        ("POST", "/collar/collar-1/unbind-from-user"),
+    ]
+    assert json.loads(requests[0].content) == {"CollarId": "collar-1"}
+    assert parse_qs(requests[1].url.query.decode()) == {"RefreshTelemetry": ["True"]}
+    assert requests[3].content == b""
+    assert requests[4].content == b""
+
+
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [
+        ("collar", ("../collar",)),
+        ("bind_collar_to_pet", ("pet-1", "../collar")),
+        ("bind_collar_to_pet", ("../pet", "collar-1")),
+        ("unbind_collar_from_pet", ("../pet",)),
+        ("unbind_collar_from_user", ("../collar",)),
+    ],
+)
+def test_collar_pet_provisioning_rejects_path_injection(tmp_path, method, args) -> None:
+    client = _stub_client(tmp_path, lambda _: pytest.fail("request should not be sent"))
+
+    with pytest.raises(ValueError):
+        getattr(client, method)(*args)
+
+
+def test_firmware_status_reads_only_the_proven_collar_routes(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+    active = {
+        "id": "collar-1",
+        "serialNumber": "SERIAL-1",
+        "type": "version5",
+        "firmware": {
+            "id": "installed-1",
+            "version": "03.08.00",
+            "firmwareLatestProduction": False,
+            "firmwareLatestBeta": False,
+        },
+        "hasFirmwareUpdatesAvailable": True,
+        "firmwareUpdate": {
+            "firmware": {"id": "target-1", "version": "03.09.00"},
+            "update": {"status": "downloading"},
+        },
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/collar/my":
+            return httpx.Response(200, json=[active])
+        if request.url.path == "/collar/collar-1":
+            return httpx.Response(200, json=active)
+        raise AssertionError(request.url)
+
+    client = _stub_client(tmp_path, handler)
+    statuses = client.firmware_statuses()
+    status = client.firmware_status("collar-1")
+
+    assert statuses == [status]
+    assert status == {
+        "collarId": "collar-1",
+        "serialNumber": "SERIAL-1",
+        "collarType": "version5",
+        "firmware": active["firmware"],
+        "hasFirmwareUpdatesAvailable": True,
+        "firmwareUpdate": active["firmwareUpdate"],
+        "updateStatus": "downloading",
+    }
+    assert client.firmware_update_state(status) is FirmwareUpdateStatus.DOWNLOADING
+    assert [(request.method, request.url.path) for request in requests] == [
+        ("GET", "/collar/my"),
+        ("GET", "/collar/collar-1"),
+    ]
+
+
+def test_firmware_state_enum_covers_the_proven_wire_values() -> None:
+    assert {item.value for item in FirmwareUpdateStatus} == {
+        "unknown",
+        "downloadDelayedIncompatibleNetwork",
+        "downloadDelayedLowBattery",
+        "downloading",
+        "downloadFailed",
+        "verifying",
+        "verifyFailed",
+        "applyDelayedNotCharging",
+        "applying",
+        "applyFailed",
+        "downloadDelayedNotOnCharger",
+        "applied",
+        "downloadNotStarted",
+    }
+    assert FirmwareUpdateStatus.parse("download-delayed-low-battery") is (
+        FirmwareUpdateStatus.DOWNLOAD_DELAYED_LOW_BATTERY
+    )
+    assert HaloClient.firmware_update_state({"updateStatus": "futureState"}) == "futureState"
+    assert HaloClient.firmware_update_state({"firmwareUpdate": None}) is None
+
+
 def test_pet_mode_routes_keep_fences_and_beacons_separate(tmp_path) -> None:
     requests: list[httpx.Request] = []
 
@@ -769,6 +1318,224 @@ def test_pet_mode_routes_reject_path_injection(tmp_path, method) -> None:
         getattr(client, method)("../pet-2", True)
 
 
+def test_beacons_uses_the_observed_route_and_preserves_configuration(tmp_path) -> None:
+    payload = {
+        "beacons": [],
+        "availableRanges": [
+            {"level": 1, "radiusInDecibel": -42},
+            {"level": 3, "radiusInDecibel": -50},
+        ],
+        "defaultRange": {"level": 3, "radiusInDecibel": -50},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/beacon/my"
+        assert request.url.query == b""
+        return httpx.Response(200, json=payload)
+
+    client = _stub_client(tmp_path, handler)
+
+    assert client.beacons() == payload
+
+
+def test_beacon_name_and_binding_checks_match_the_contract(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/beacon/check-name-uniqueness":
+            return httpx.Response(204 if len(requests) == 1 else 409)
+        return httpx.Response(
+            200,
+            json={
+                "result": False,
+                "isBeaconBoundToCurrentUser": True,
+                "isBeaconBoundToAnotherUser": False,
+            },
+        )
+
+    client = _stub_client(tmp_path, handler)
+
+    assert client.beacon_name_is_available("Kitchen") is True
+    assert client.beacon_name_is_available("Kitchen", beacon_id="beacon-1") is False
+    binding = client.check_beacon_binding("BEACON-SERIAL")
+
+    assert binding["isBeaconBoundToCurrentUser"] is True
+    assert json.loads(requests[0].content) == {"Id": None, "Name": "Kitchen"}
+    assert json.loads(requests[1].content) == {"Id": "beacon-1", "Name": "Kitchen"}
+    assert requests[2].url.path == "/beacon/check-can-be-bound-to-user"
+    assert json.loads(requests[2].content) == {"SerialNumber": "BEACON-SERIAL"}
+
+
+def test_add_beacon_sends_pascal_case_configuration(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            201,
+            json={
+                "id": "beacon-1",
+                "name": "Kitchen",
+                "modelType": "usb",
+                "petsSync": [
+                    {"petId": "pet-1", "status": "pending", "isAssigned": True}
+                ],
+            },
+        )
+
+    client = _stub_client(tmp_path, handler)
+    created = client.add_beacon(
+        name="Kitchen",
+        serial_number="BEACON-SERIAL",
+        model_type=BeaconModelType.USB,
+        action_type=BeaconActionType.KEEP_AWAY,
+        should_notify=True,
+        beacon_range={"Level": 3, "RadiusInDecibel": -50},
+        is_enabled=True,
+        transmission_rate_milliseconds=1000,
+        correction_escalation_type=BeaconCorrectionEscalationType.WARNING,
+        pet_id="pet-1",
+    )
+
+    assert created["id"] == "beacon-1"
+    assert json.loads(requests[0].content) == {
+        "Name": "Kitchen",
+        "SerialNumber": "BEACON-SERIAL",
+        "ModelType": "Usb",
+        "Range": {"Level": 3, "RadiusInDecibel": -50},
+        "IsEnabled": True,
+        "ActionType": "KeepAway",
+        "ShouldNotify": True,
+        "TransmissionRateMilliseconds": 1000,
+        "CorrectionEscalationType": "Warning",
+        "PetId": "pet-1",
+    }
+
+
+def test_update_beacon_distinguishes_omitted_fields_from_null(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "beacon-1", "name": "Back Door"})
+
+    client = _stub_client(tmp_path, handler)
+    updated = client.update_beacon(
+        "beacon-1",
+        name="Back Door",
+        is_enabled=None,
+        action_type="ignore-fences",
+        beacon_range={"Level": 5, "RadiusInDecibel": -57},
+        pet_id=None,
+    )
+
+    assert updated["name"] == "Back Door"
+    assert requests[0].url.path == "/beacon/beacon-1"
+    assert json.loads(requests[0].content) == {
+        "Name": "Back Door",
+        "IsEnabled": None,
+        "ActionType": "IgnoreFences",
+        "Range": {"Level": 5, "RadiusInDecibel": -57},
+        "PetId": None,
+    }
+
+
+def test_delete_beacon_and_upload_telemetry_use_empty_successes(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    client = _stub_client(tmp_path, handler)
+
+    assert client.delete_beacon("beacon-1") is None
+    assert (
+        client.upload_beacon_telemetry(
+            [
+                {"SerialNumber": "BEACON-1", "BatteryChargePercent": 85},
+                {"SerialNumber": "BEACON-2", "BatteryChargePercent": 42},
+            ]
+        )
+        is None
+    )
+    assert requests[0].method == "DELETE"
+    assert requests[0].url.path == "/beacon/beacon-1"
+    assert requests[0].content == b""
+    assert requests[1].url.path == "/beacon/telemetry"
+    assert json.loads(requests[1].content) == {
+        "BeaconsTelemetry": [
+            {"SerialNumber": "BEACON-1", "BatteryChargePercent": 85},
+            {"SerialNumber": "BEACON-2", "BatteryChargePercent": 42},
+        ]
+    }
+
+
+def test_beacon_pet_sync_reads_async_distribution_state(tmp_path) -> None:
+    payload = {
+        "beacons": [
+            {
+                "id": "beacon-1",
+                "petsSync": [
+                    {"petId": "pet-1", "status": "completed", "isAssigned": True},
+                    {"petId": "pet-2", "status": "skipped", "isAssigned": True},
+                ],
+            }
+        ]
+    }
+    client = _stub_client(tmp_path, lambda _: httpx.Response(200, json=payload))
+
+    assert [item["status"] for item in client.beacon_pet_sync("beacon-1")] == [
+        "completed",
+        "skipped",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("call", "message"),
+    [
+        (
+            lambda client: client.add_beacon(
+                name="Kitchen",
+                serial_number="serial",
+                model_type="bad",
+                action_type="KeepAway",
+                should_notify=True,
+            ),
+            "model type",
+        ),
+        (
+            lambda client: client.update_beacon("beacon-1"),
+            "at least one",
+        ),
+        (
+            lambda client: client.add_beacon(
+                name="Kitchen",
+                serial_number="serial",
+                model_type="Usb",
+                action_type="KeepAway",
+                should_notify=True,
+                beacon_range={"Level": 3},
+            ),
+            "RadiusInDecibel",
+        ),
+        (
+            lambda client: client.upload_beacon_telemetry(
+                [{"SerialNumber": "serial", "BatteryChargePercent": 101}]
+            ),
+            "between 0 and 100",
+        ),
+    ],
+)
+def test_beacon_mutations_validate_local_inputs(tmp_path, call, message) -> None:
+    client = _stub_client(tmp_path, lambda _: pytest.fail("request should not be sent"))
+
+    with pytest.raises(ValueError, match=message):
+        call(client)
+
+
 def test_push_subscription_matches_the_expected_bodies(tmp_path) -> None:
     requests: list[httpx.Request] = []
 
@@ -798,7 +1565,7 @@ def test_pets_requires_a_list_of_objects(tmp_path) -> None:
 
 
 def test_pets_lists_pets_that_have_no_collar(tmp_path) -> None:
-    # /collar/my/ only reaches pets with a collar bound, so this endpoint is the
+    # /collar/my only reaches pets with a collar bound, so this endpoint is the
     # only way to see a pet whose collarInfo is still null.
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/pet/my"
@@ -819,17 +1586,31 @@ def test_geo_fence_add_matches_the_expected_body(tmp_path) -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(200, json={"geoFence": {"zones": []}})
+        return httpx.Response(
+            200,
+            json={
+                "geoFence": {
+                    "id": "fence-1",
+                    "zones": [],
+                    "petsSync": [
+                        {"petId": "pet-1", "status": "pending", "isAssigned": True}
+                    ],
+                },
+                "status": "success",
+            },
+        )
 
     client = _stub_client(tmp_path, handler)
-    client.add_geo_fence(
+    result = client.add_geo_fence(
         "My Fence 1",
         [(40.0001, -75.0001), (40.0002, -75.00015), (40.0003, -75.00005)],
     )
 
-    import json as _json
-
-    assert _json.loads(requests[0].content) == {
+    assert result["status"] == "success"
+    assert result["geoFence"]["petsSync"] == [
+        {"petId": "pet-1", "status": "pending", "isAssigned": True}
+    ]
+    assert json.loads(requests[0].content) == {
         "Name": "My Fence 1",
         "LocationPoints": [
             {"Latitude": 40.0001, "Longitude": -75.0001},
@@ -837,6 +1618,40 @@ def test_geo_fence_add_matches_the_expected_body(tmp_path) -> None:
             {"Latitude": 40.0003, "Longitude": -75.00005},
         ],
         "PublicVisibilityType": "Private",
+        "Analytics": None,
+    }
+
+
+def test_safe_zone_preview_sends_warning_boundary_and_returns_generated_zone(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+    generated = [
+        {
+            "areaInSquareMeters": 2293.78,
+            "type": "safe",
+            "locationPoints": [
+                {"latitude": 44.0, "longitude": -92.0},
+                {"latitude": 44.001, "longitude": -92.0},
+                {"latitude": 44.0, "longitude": -92.001},
+            ],
+        }
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=generated)
+
+    points = [(44.0, -92.0), (44.001, -92.0), (44.0, -92.001)]
+    client = _stub_client(tmp_path, handler)
+
+    assert client.geo_fence_safe_zones(points) == generated
+    assert requests[0].method == "POST"
+    assert requests[0].url.path == "/geo-fence/safe-zones"
+    assert json.loads(requests[0].content) == {
+        "LocationPoints": [
+            {"Latitude": 44.0, "Longitude": -92.0},
+            {"Latitude": 44.001, "Longitude": -92.0},
+            {"Latitude": 44.0, "Longitude": -92.001},
+        ],
         "Analytics": None,
     }
 
@@ -885,6 +1700,36 @@ def test_geo_fence_name_check_sends_null_id_when_creating(tmp_path) -> None:
     }
 
 
+def test_geo_fence_rename_and_location_update_match_observed_responses(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/geo-fence/fence-1":
+            return httpx.Response(200)
+        if request.url.path == "/geo-fence/fence-1/location":
+            return httpx.Response(200, json={"status": "success"})
+        raise AssertionError(request.url)
+
+    points = [(44.0, -92.0), (44.001, -92.0), (44.0, -92.001)]
+    analytics = {"AreaInSquareMeters": 1968.91, "Warnings": []}
+    client = _stub_client(tmp_path, handler)
+
+    assert client.rename_geo_fence("fence-1", "New name") is None
+    assert client.update_geo_fence_location("fence-1", points, analytics=analytics) == {
+        "status": "success"
+    }
+    assert json.loads(requests[0].content) == {"Name": "New name"}
+    assert json.loads(requests[1].content) == {
+        "LocationPoints": [
+            {"Latitude": 44.0, "Longitude": -92.0},
+            {"Latitude": 44.001, "Longitude": -92.0},
+            {"Latitude": 44.0, "Longitude": -92.001},
+        ],
+        "Analytics": analytics,
+    }
+
+
 def test_delete_geo_fence_uses_delete_and_validates_the_id(tmp_path) -> None:
     requests: list[httpx.Request] = []
 
@@ -895,6 +1740,7 @@ def test_delete_geo_fence_uses_delete_and_validates_the_id(tmp_path) -> None:
     client = _stub_client(tmp_path, handler)
     assert client.delete_geo_fence("22222222-2222-4222-8222-222222222222") == {"status": "success"}
     assert requests[0].method == "DELETE"
+    assert requests[0].content == b""
     with pytest.raises(ValueError):
         client.delete_geo_fence("../pet/x")
 

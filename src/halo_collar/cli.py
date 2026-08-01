@@ -40,7 +40,15 @@ from .errors import (
     StaleCommandNumberError,
     UnsafeCorrectionError,
 )
-from .models import CorrectionType
+from .models import (
+    BeaconActionType,
+    BeaconCorrectionEscalationType,
+    BeaconModelType,
+    CorrectionRuleKindType,
+    CorrectionRuleUpdate,
+    CorrectionType,
+    WalkStopOption,
+)
 from .output import (
     Column,
     Output,
@@ -120,12 +128,13 @@ NOUNS
   account       Profile, subscription, and the combined map view
   pet           List, inspect, create, edit, and delete pets
   collar        List collars and play a collar's locate tone
+  firmware      Read installed firmware and server-managed update progress
   fence         List and change containment fences
   beacon        List beacons and their ranges
   walk          List recorded walks
   live          Stream live telemetry and notification events
   notification  Notification history and the in-app inbox
-  correction    Send a correction and read the rules behind it
+  correction    Send, test, and configure correction feedback
   training      Training course progress
   device        Register this installation with Halo
   parcel        Look up land records the fence editor uses
@@ -299,6 +308,27 @@ def _pet_profile_arguments(parser: argparse.ArgumentParser, *, required: bool) -
     parser.add_argument("--weight-kg", required=required, type=float, help="Weight in kilograms.")
 
 
+def _correction_feedback_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "kind_type",
+        choices=[item.value for item in CorrectionRuleKindType],
+        help="Feedback modality: Sound, Vibration, or Shock (static feedback).",
+    )
+    parser.add_argument(
+        "--level",
+        type=int,
+        help="Sound or shock intensity level from `halo correction config`.",
+    )
+    parser.add_argument(
+        "--sound-id",
+        help="Sound UUID from `halo correction config`; required for Sound.",
+    )
+    parser.add_argument(
+        "--vibration-id",
+        help="Vibration UUID from `halo correction config`; required for Vibration.",
+    )
+
+
 def _fence_point_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--point",
@@ -342,6 +372,7 @@ def build_parser() -> argparse.ArgumentParser:
     _build_account(subparsers)
     _build_pet(subparsers)
     _build_collar(subparsers)
+    _build_firmware(subparsers)
     _build_fence(subparsers)
     _build_beacon(subparsers)
     _build_walk(subparsers)
@@ -502,8 +533,8 @@ def _build_pet(subparsers: Any) -> None:
     pet = _group(
         subparsers,
         "pet",
-        help_text="List, inspect, create, edit, and delete pets.",
-        description="Work with the pets on the account, with or without collars.",
+        help_text="Manage pets and their collar modes.",
+        description="Work with pets on the account, with or without collars.",
     )
     _with_full(
         _leaf(
@@ -578,6 +609,46 @@ def _build_pet(subparsers: Any) -> None:
     )
     delete.add_argument("pet_id", help="The pet's UUID, from `halo pet list`.")
 
+    bind_collar = _with_confirmation(
+        _leaf(
+            pet,
+            "bind-collar",
+            help_text="Attach an account-bound collar to a pet.",
+            description=(
+                "Attach a collar already bound to the account. COLLAR_ID is Halo's "
+                "server UUID from `halo collar list`, not a serial number or ESN."
+            ),
+            examples=(
+                "  halo pet bind-collar PET_ID COLLAR_ID\n"
+                "  halo pet bind-collar PET_ID COLLAR_ID --yes"
+            ),
+            handler=_pet_bind_collar,
+        )
+    )
+    bind_collar.add_argument("pet_id", help="The pet's UUID, from `halo pet list`.")
+    bind_collar.add_argument(
+        "collar_id",
+        help="The server-issued collar UUID, from `halo collar list`.",
+    )
+
+    unbind_collar = _with_confirmation(
+        _leaf(
+            pet,
+            "unbind-collar",
+            help_text="Detach a collar from a pet but keep it on the account.",
+            description=(
+                "Remove the pet-to-collar relationship only. The collar remains "
+                "registered to the authenticated Halo account."
+            ),
+            examples=(
+                "  halo pet unbind-collar PET_ID\n"
+                "  halo pet unbind-collar PET_ID --yes"
+            ),
+            handler=_pet_unbind_collar,
+        )
+    )
+    unbind_collar.add_argument("pet_id", help="The pet's UUID, from `halo pet list`.")
+
     _leaf(
         pet,
         "colors",
@@ -586,6 +657,44 @@ def _build_pet(subparsers: Any) -> None:
         examples="  halo pet colors\n  halo pet colors --plain",
         handler=_pet_colors,
     )
+
+    fences = _with_confirmation(
+        _leaf(
+            pet,
+            "fences",
+            help_text="Turn a pet's containment fences on or off.",
+            description=(
+                "Set the cloud's desired containment mode. The response also carries "
+                "the collar's last reported mode, which may lag behind the desired mode."
+            ),
+            examples=(
+                "  halo pet fences PET_ID off\n"
+                "  halo pet fences PET_ID on --yes"
+            ),
+            handler=_pet_fences,
+        )
+    )
+    fences.add_argument("pet_id", help="The pet's UUID, from `halo pet list`.")
+    fences.add_argument("state", choices=("on", "off"), help="Desired containment state.")
+
+    beacons = _with_confirmation(
+        _leaf(
+            pet,
+            "beacons",
+            help_text="Turn a pet's beacon assignment on or off.",
+            description=(
+                "Enable or disable beacon assignment for a pet. Halo handles this "
+                "separately from the containment-fence mode."
+            ),
+            examples=(
+                "  halo pet beacons PET_ID off\n"
+                "  halo pet beacons PET_ID on --yes"
+            ),
+            handler=_pet_beacons,
+        )
+    )
+    beacons.add_argument("pet_id", help="The pet's UUID, from `halo pet list`.")
+    beacons.add_argument("state", choices=("on", "off"), help="Desired beacon assignment.")
 
 
 def _build_collar(subparsers: Any) -> None:
@@ -608,6 +717,19 @@ def _build_collar(subparsers: Any) -> None:
             handler=_collar_list,
         )
     )
+    show = _leaf(
+        collar,
+        "show",
+        help_text="Fetch one collar and its current pet assignment.",
+        description=(
+            "Fetch one account collar in full. Inspect petInfo to confirm its "
+            "current reciprocal pet relationship."
+        ),
+        examples="  halo collar show COLLAR_ID",
+        handler=_collar_show,
+    )
+    show.add_argument("collar_id", help="The collar's UUID, from `halo collar list`.")
+
     locate = _leaf(
         collar,
         "locate",
@@ -662,6 +784,66 @@ def _build_collar(subparsers: Any) -> None:
         "encrypted_serial_number",
         help="The encrypted serial returned by the physical collar over Bluetooth.",
     )
+
+    remove = _with_confirmation(
+        _leaf(
+            collar,
+            "remove",
+            help_text="Remove a collar from the authenticated account.",
+            description=(
+                "Remove the collar-to-account relationship. This is distinct from "
+                "`halo pet unbind-collar`; the server's behavior for an assigned "
+                "collar has not been directly observed."
+            ),
+            examples=(
+                "  halo collar remove COLLAR_ID\n"
+                "  halo collar remove COLLAR_ID --yes"
+            ),
+            handler=_collar_remove,
+        )
+    )
+    remove.add_argument("collar_id", help="The collar's UUID, from `halo collar list`.")
+
+
+def _build_firmware(subparsers: Any) -> None:
+    firmware = _group(
+        subparsers,
+        "firmware",
+        help_text="Read installed firmware and server-managed update progress.",
+        description=(
+            "Read firmware snapshots from Halo's collar endpoints. Firmware rollout "
+            "is server-managed; no customer-facing start, cancel, or channel-selection "
+            "HTTP operation is known."
+        ),
+    )
+    listing = _leaf(
+        firmware,
+        "list",
+        help_text="Show firmware status for every account collar.",
+        description=(
+            "List installed versions, target versions, and asynchronous update "
+            "states. --full preserves the complete firmware metadata."
+        ),
+        examples="  halo firmware list\n  halo firmware list --full",
+        handler=_firmware_list,
+    )
+    listing.add_argument(
+        "--full",
+        action="store_true",
+        help="Print complete nested firmware and target metadata as JSON.",
+    )
+    show = _leaf(
+        firmware,
+        "show",
+        help_text="Show one collar's complete firmware status.",
+        description=(
+            "Read one collar's installed firmware and pending update snapshot. "
+            "Failures and paused states appear inside a successful response."
+        ),
+        examples="  halo firmware show COLLAR_ID",
+        handler=_firmware_show,
+    )
+    show.add_argument("collar_id", help="The collar's UUID, from `halo collar list`.")
 
 
 def _build_fence(subparsers: Any) -> None:
@@ -755,8 +937,11 @@ def _build_beacon(subparsers: Any) -> None:
     beacon = _group(
         subparsers,
         "beacon",
-        help_text="List beacons and their ranges.",
-        description="Read the beacons registered to the account.",
+        help_text="List, bind, configure, and remove beacons.",
+        description=(
+            "Manage account beacons. Per-pet assignment is controlled by "
+            "`halo pet beacons`, not by an individual beacon id."
+        ),
     )
     _leaf(
         beacon,
@@ -767,13 +952,184 @@ def _build_beacon(subparsers: Any) -> None:
         handler=_beacon_list,
     )
 
+    check_name = _leaf(
+        beacon,
+        "check-name",
+        help_text="Check whether a beacon name is available.",
+        description="Check a proposed name; pass --beacon-id when renaming.",
+        examples=(
+            "  halo beacon check-name Kitchen\n"
+            "  halo beacon check-name Kitchen --beacon-id BEACON_ID"
+        ),
+        handler=_beacon_check_name,
+    )
+    check_name.add_argument("name", help="Proposed beacon name.")
+    check_name.add_argument("--beacon-id", help="Existing beacon id when renaming.")
+
+    check_binding = _leaf(
+        beacon,
+        "check-binding",
+        help_text="Check whether a beacon serial can bind to this account.",
+        description=(
+            "Check binding eligibility. A successful HTTP request may return result=false."
+        ),
+        examples="  halo beacon check-binding BEACON_SERIAL",
+        handler=_beacon_check_binding,
+    )
+    check_binding.add_argument("serial_number", help="Serial printed on the physical beacon.")
+
+    sync = _leaf(
+        beacon,
+        "sync",
+        help_text="Show one beacon's per-pet synchronization state.",
+        description=(
+            "Read petsSync for one account beacon. completed confirms collar "
+            "distribution; pending and skipped are preserved."
+        ),
+        examples="  halo beacon sync BEACON_ID",
+        handler=_beacon_sync,
+    )
+    sync.add_argument("beacon_id", help="Beacon server id, from `halo beacon list`.")
+
+    add = _with_confirmation(
+        _leaf(
+            beacon,
+            "add",
+            help_text="Add or bind a physical beacon.",
+            description=(
+                "Create the account beacon record using its physical serial and "
+                "configuration. Available range pairs come from `halo beacon list`."
+            ),
+            examples=(
+                "  halo beacon add --name Kitchen --serial-number SERIAL "
+                "--model-type Usb --action-type KeepAway --should-notify "
+                "--range-level 3 --radius-in-decibel -50\n"
+                "  halo beacon add --name Kitchen --serial-number SERIAL "
+                "--model-type Usb --action-type KeepAway --should-notify --yes"
+            ),
+            handler=_beacon_add,
+        )
+    )
+    add.add_argument("--name", required=True, help="Beacon display name.")
+    add.add_argument("--serial-number", required=True, help="Physical beacon serial.")
+    add.add_argument(
+        "--model-type",
+        required=True,
+        choices=tuple(item.value for item in BeaconModelType),
+    )
+    add.add_argument(
+        "--action-type",
+        required=True,
+        choices=tuple(item.value for item in BeaconActionType),
+    )
+    add.add_argument(
+        "--should-notify",
+        action=argparse.BooleanOptionalAction,
+        required=True,
+        help="Whether Halo should emit beacon notifications.",
+    )
+    add.add_argument(
+        "--is-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Initial enabled state; omit to send null.",
+    )
+    add.add_argument("--range-level", type=int, help="Range level from availableRanges.")
+    add.add_argument("--radius-in-decibel", type=int, help="Matching range radius.")
+    add.add_argument("--transmission-rate-ms", type=int, help="Transmission interval.")
+    add.add_argument(
+        "--correction-escalation-type",
+        choices=tuple(item.value for item in BeaconCorrectionEscalationType),
+    )
+    add.add_argument("--pet-id", help="Optional initial pet id.")
+
+    update = _with_confirmation(
+        _leaf(
+            beacon,
+            "update",
+            help_text="Update supplied settings on one beacon.",
+            description=(
+                "Send only the supplied fields to the beacon's PUT route. The beacon "
+                "server id is required; its serial number is not a substitute."
+            ),
+            examples=(
+                "  halo beacon update BEACON_ID --name 'Back Door'\n"
+                "  halo beacon update BEACON_ID --action-type IgnoreFences "
+                "--range-level 5 --radius-in-decibel -57 --yes"
+            ),
+            handler=_beacon_update,
+        )
+    )
+    update.add_argument("beacon_id", help="Beacon server id, from `halo beacon list`.")
+    update.add_argument("--name", default=argparse.SUPPRESS)
+    update.add_argument(
+        "--is-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+    )
+    update.add_argument(
+        "--action-type",
+        choices=tuple(item.value for item in BeaconActionType),
+        default=argparse.SUPPRESS,
+    )
+    update.add_argument(
+        "--should-notify",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+    )
+    update.add_argument("--range-level", type=int, default=argparse.SUPPRESS)
+    update.add_argument("--radius-in-decibel", type=int, default=argparse.SUPPRESS)
+    update.add_argument(
+        "--model-type",
+        choices=tuple(item.value for item in BeaconModelType),
+        default=argparse.SUPPRESS,
+    )
+    update.add_argument("--transmission-rate-ms", type=int, default=argparse.SUPPRESS)
+    update.add_argument(
+        "--correction-escalation-type",
+        choices=tuple(item.value for item in BeaconCorrectionEscalationType),
+        default=argparse.SUPPRESS,
+    )
+    update.add_argument("--pet-id", default=argparse.SUPPRESS)
+
+    delete = _with_confirmation(
+        _leaf(
+            beacon,
+            "delete",
+            help_text="Delete or unbind a beacon.",
+            description=(
+                "Delete the account beacon record. Refresh `halo beacon list` to "
+                "confirm removal."
+            ),
+            examples="  halo beacon delete BEACON_ID\n  halo beacon delete BEACON_ID --yes",
+            handler=_beacon_delete,
+        )
+    )
+    delete.add_argument("beacon_id", help="Beacon server id, from `halo beacon list`.")
+
+    telemetry = _leaf(
+        beacon,
+        "telemetry",
+        help_text="Upload locally observed beacon battery telemetry.",
+        description=(
+            "Read a JSON array of PascalCase SerialNumber and BatteryChargePercent "
+            "objects and upload it. This updates cloud telemetry, not beacon settings."
+        ),
+        examples="  halo beacon telemetry readings.json",
+        handler=_beacon_telemetry,
+    )
+    telemetry.add_argument("readings_file", help="Path to the telemetry JSON array.")
+
 
 def _build_walk(subparsers: Any) -> None:
     walk = _group(
         subparsers,
         "walk",
-        help_text="List recorded walks.",
-        description="Read the walk history Halo records.",
+        help_text="Read and complete existing walks.",
+        description=(
+            "Read walk history and operate on a walk already started by a collar or "
+            "the Bluetooth mobile flow. HTTP cannot start an ordinary walk."
+        ),
     )
     listing = _leaf(
         walk,
@@ -785,6 +1141,119 @@ def _build_walk(subparsers: Any) -> None:
     )
     listing.add_argument("--page", type=int, default=1, help="Page number (default: 1).")
     listing.add_argument("--page-size", type=int, default=30, help="Rows per page (default: 30).")
+
+    summary = _leaf(
+        walk,
+        "summary",
+        help_text="Fetch one completed walk.",
+        description=(
+            "Fetch one completed walk summary, including trail-image URLs when their "
+            "separate uploads have finished processing."
+        ),
+        examples="  halo walk summary WALK_ID",
+        handler=_walk_summary,
+    )
+    summary.add_argument("walk_id", help="The walk UUID, from `halo walk list` or telemetry.")
+
+    for verb, paused in (("pause", True), ("resume", False)):
+        command = _with_confirmation(
+            _leaf(
+                walk,
+                verb,
+                help_text=f"{verb.title()} one collar's existing walk.",
+                description=(
+                    f"{verb.title()} one collar through Halo's remote walk command. "
+                    "A success result is acknowledgement; confirm with fresh telemetry."
+                ),
+                examples=(
+                    f"  halo walk {verb} WALK_ID COLLAR_ID\n"
+                    f"  halo walk {verb} WALK_ID COLLAR_ID --yes"
+                ),
+                handler=_walk_pause if paused else _walk_resume,
+            )
+        )
+        command.add_argument("walk_id", help="The existing walk UUID.")
+        command.add_argument("collar_id", help="The participating collar UUID.")
+
+    stop = _with_confirmation(
+        _leaf(
+            walk,
+            "stop",
+            help_text="Stop one collar's existing walk.",
+            description=(
+                "Stop one participating collar. This does not finalize a multi-pet "
+                "walk; confirm application when fresh telemetry reports walk=null."
+            ),
+            examples=(
+                "  halo walk stop WALK_ID COLLAR_ID\n"
+                "  halo walk stop WALK_ID COLLAR_ID --stop-option ForceSetFencesOn --yes"
+            ),
+            handler=_walk_stop,
+        )
+    )
+    stop.add_argument("walk_id", help="The existing walk UUID.")
+    stop.add_argument("collar_id", help="The participating collar UUID.")
+    stop.add_argument(
+        "--stop-option",
+        choices=tuple(option.value for option in WalkStopOption),
+        default=WalkStopOption.DEFAULT.value,
+        help="How leash mode should leave fences configured (default: Default).",
+    )
+
+    mark_ended = _leaf(
+        walk,
+        "mark-ended",
+        help_text="Submit a completed walk summary from a JSON file.",
+        description=(
+            "Submit the final aggregate summary. The JSON file uses PascalCase "
+            "StartedAt, EndedAt, Pets, User, and LocationName fields and contains "
+            "no raw trail points. Image uploads are separate commands."
+        ),
+        examples="  halo walk mark-ended WALK_ID summary.json",
+        handler=_walk_mark_ended,
+    )
+    mark_ended.add_argument("walk_id", help="The completed walk UUID.")
+    mark_ended.add_argument("summary_file", help="Path to the PascalCase summary JSON file.")
+
+    thumbnail = _leaf(
+        walk,
+        "upload-thumbnail",
+        help_text="Upload the rendered overall trail thumbnail.",
+        description="Upload image bytes as the multipart trail-thumbnail field.",
+        examples=(
+            "  halo walk upload-thumbnail WALK_ID overview.png\n"
+            "  halo walk upload-thumbnail WALK_ID overview.jpg --content-type image/jpeg"
+        ),
+        handler=_walk_upload_thumbnail,
+    )
+    thumbnail.add_argument("walk_id", help="The completed walk UUID.")
+    thumbnail.add_argument("image_file", help="Path to the rendered image.")
+    thumbnail.add_argument(
+        "--content-type",
+        default="image/png",
+        help="Image MIME type (default: image/png).",
+    )
+
+    pet_image = _leaf(
+        walk,
+        "upload-pet-image",
+        help_text="Upload one pet's rendered trail image.",
+        description="Upload image bytes as the multipart trail-image field.",
+        examples=(
+            "  halo walk upload-pet-image WALK_ID PET_ID pet-trail.png\n"
+            "  halo walk upload-pet-image WALK_ID PET_ID pet-trail.jpg "
+            "--content-type image/jpeg"
+        ),
+        handler=_walk_upload_pet_image,
+    )
+    pet_image.add_argument("walk_id", help="The completed walk UUID.")
+    pet_image.add_argument("pet_id", help="The pet UUID represented by the image.")
+    pet_image.add_argument("image_file", help="Path to the rendered image.")
+    pet_image.add_argument(
+        "--content-type",
+        default="image/png",
+        help="Image MIME type (default: image/png).",
+    )
 
 
 def _build_live(subparsers: Any) -> None:
@@ -900,10 +1369,10 @@ def _build_correction(subparsers: Any) -> None:
     correction = _group(
         subparsers,
         "correction",
-        help_text="Send a correction and read the rules behind it.",
+        help_text="Send, test, and configure correction feedback.",
         description=(
-            "A correction is a physical action. Cloud acceptance does not prove the "
-            "collar executed it, and this client never retries one."
+            "Direct corrections and collar tests are physical actions. Cloud acceptance "
+            "does not prove execution, and this client never retries either one."
         ),
     )
     send = _with_confirmation(
@@ -960,6 +1429,66 @@ def _build_correction(subparsers: Any) -> None:
         description="Show Halo's global catalog of sounds, vibrations, and intensity levels.",
         examples="  halo correction config",
         handler=_correction_config,
+    )
+
+    update = _with_confirmation(
+        _leaf(
+            correction,
+            "update",
+            help_text="Update one identified persistent correction rule.",
+            description=(
+                "Update one existing rule by its rule UUID. The rule ID implicitly "
+                "selects the pet and escalation slot; omitted rules are left alone. "
+                "Use IDs and levels from `halo correction config`."
+            ),
+            examples=(
+                "  halo correction update RULE_ID Sound --level 3 --sound-id SOUND_ID\n"
+                "  halo correction update RULE_ID Vibration --vibration-id VIBRATION_ID\n"
+                "  halo correction update RULE_ID Shock --level 1"
+            ),
+            handler=_correction_update,
+        )
+    )
+    update.add_argument("rule_id", help="The existing rule UUID from `halo correction rules`.")
+    _correction_feedback_arguments(update)
+
+    test = _with_confirmation(
+        _leaf(
+            correction,
+            "test",
+            help_text="Test proposed feedback directly on a collar.",
+            description=(
+                "Send exactly one proposed sound, vibration, or static-feedback setting "
+                "to a pet's collar without saving it as a persistent rule. The collar "
+                "must report online unless you explicitly skip that check."
+            ),
+            examples=(
+                "  halo correction test PET_ID Sound --level 1 --sound-id SOUND_ID "
+                "--command-number 13\n"
+                "  halo correction test PET_ID Vibration --vibration-id VIBRATION_ID\n"
+                "  halo correction test PET_ID Shock --level 1"
+            ),
+            handler=_correction_test,
+        )
+    )
+    test.add_argument("pet_id", help="The pet's UUID, from `halo pet list`.")
+    _correction_feedback_arguments(test)
+    test.add_argument(
+        "--command-number",
+        type=int,
+        help="Required on first use: the next known Halo command number.",
+    )
+    test.add_argument(
+        "--expires-in",
+        type=int,
+        default=30,
+        metavar="SECONDS",
+        help="Expire the direct command after this many seconds (default: 30).",
+    )
+    test.add_argument(
+        "--skip-online-check",
+        action="store_true",
+        help="Send even when Halo does not report a socket-connected collar.",
     )
 
 
@@ -1345,6 +1874,49 @@ def _pet_delete(args: argparse.Namespace, client: HaloClient, out: Output) -> in
     return EXIT_OK
 
 
+def _pet_bind_collar(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    if not _confirmed(
+        args,
+        out,
+        warning=(
+            f"\nThis will attach account collar {args.collar_id} to pet {args.pet_id}. "
+            "The HTTP response does not prove that collar synchronization completed."
+        ),
+        prompt=f"Type the pet id ({args.pet_id}) to attach the collar: ",
+        expected=args.pet_id,
+        cancelled="Cancelled; the collar was not attached to the pet.",
+    ):
+        return EXIT_NO_LOGIN
+    client.bind_collar_to_pet(args.pet_id, args.collar_id)
+    out.note(
+        f"Requested attachment of collar {args.collar_id} to pet {args.pet_id}. "
+        f"Confirm with `halo pet show {args.pet_id} --refresh-telemetry` and "
+        f"`halo collar show {args.collar_id}`."
+    )
+    return EXIT_OK
+
+
+def _pet_unbind_collar(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    if not _confirmed(
+        args,
+        out,
+        warning=(
+            f"\nThis will detach the current collar from pet {args.pet_id}. "
+            "The collar will remain registered to the account."
+        ),
+        prompt=f"Type the pet id ({args.pet_id}) to detach its collar: ",
+        expected=args.pet_id,
+        cancelled="Cancelled; the collar was not detached from the pet.",
+    ):
+        return EXIT_NO_LOGIN
+    client.unbind_collar_from_pet(args.pet_id)
+    out.note(
+        f"Requested collar detachment from pet {args.pet_id}. Confirm that a refreshed "
+        "pet has collarInfo=null and that the collar has petInfo=null."
+    )
+    return EXIT_OK
+
+
 def _pet_colors(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
     colors = client.pet_colors()
     out.emit(
@@ -1357,6 +1929,45 @@ def _pet_colors(args: argparse.Namespace, client: HaloClient, out: Output) -> in
             Column("AVAILABLE", "isAvailable"),
         ],
     )
+    return EXIT_OK
+
+
+def _pet_fences(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    if not _confirmed(
+        args,
+        out,
+        warning=(
+            f"\nThis will turn containment fences {args.state} for pet {args.pet_id}. "
+            "The cloud accepting the request does not prove the collar applied it."
+        ),
+        prompt=f"Type the pet id ({args.pet_id}) to change containment: ",
+        expected=args.pet_id,
+        cancelled="Cancelled; containment mode was not changed.",
+    ):
+        return EXIT_NO_LOGIN
+    mode = client.set_pet_fences_enabled(args.pet_id, args.state == "on")
+    out.note(
+        f"Requested containment {args.state} for {args.pet_id}. "
+        "Compare desiredMode with telemetry.mode before relying on the change."
+    )
+    out.emit(mode)
+    return EXIT_OK
+
+
+def _pet_beacons(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    if not _confirmed(
+        args,
+        out,
+        warning=f"\nThis will turn beacon assignment {args.state} for pet {args.pet_id}.",
+        prompt=f"Type the pet id ({args.pet_id}) to change beacon assignment: ",
+        expected=args.pet_id,
+        cancelled="Cancelled; beacon assignment was not changed.",
+    ):
+        return EXIT_NO_LOGIN
+    response = client.set_pet_beacons_assigned(args.pet_id, args.state == "on")
+    out.note(f"Requested beacon assignment {args.state} for {args.pet_id}.")
+    if response is not None:
+        out.emit(response)
     return EXIT_OK
 
 
@@ -1382,6 +1993,11 @@ def _collar_list(args: argparse.Namespace, client: HaloClient, out: Output) -> i
             Column("ID", "id"),
         ],
     )
+    return EXIT_OK
+
+
+def _collar_show(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    out.emit(client.collar(args.collar_id))
     return EXIT_OK
 
 
@@ -1415,6 +2031,93 @@ def _collar_bind(args: argparse.Namespace, client: HaloClient, out: Output) -> i
     bound = client.bind_collar(args.serial_number, args.encrypted_serial_number)
     out.note(f"Bound collar {args.serial_number}.")
     out.emit(bound)
+    return EXIT_OK
+
+
+def _collar_remove(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    if not _confirmed(
+        args,
+        out,
+        warning=(
+            f"\nThis will remove collar {args.collar_id} from the authenticated account. "
+            "If it is assigned to a pet, the server's cascade behavior is not confirmed; "
+            "detach it from the pet first for an explicit two-stage removal."
+        ),
+        prompt=f"Type the collar id ({args.collar_id}) to remove it: ",
+        expected=args.collar_id,
+        cancelled="Cancelled; the collar was not removed from the account.",
+    ):
+        return EXIT_NO_LOGIN
+    client.unbind_collar_from_user(args.collar_id)
+    out.note(
+        f"Requested removal of collar {args.collar_id}. Confirm it is absent from "
+        "`halo collar list` and that its former pet has collarInfo=null."
+    )
+    return EXIT_OK
+
+
+FIRMWARE_COLUMNS = [
+    Column("INSTALLED", "installedVersion"),
+    Column("TARGET", "targetVersion"),
+    Column("STATUS", "updateStatus"),
+    Column("AVAILABLE", "hasFirmwareUpdatesAvailable"),
+    Column("LATEST PROD", "latestProduction"),
+    Column("LATEST BETA", "latestBeta"),
+    Column("SERIAL", "serialNumber"),
+    Column("COLLAR ID", "collarId"),
+]
+
+
+def _firmware_rows(statuses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for status in statuses:
+        installed = status.get("firmware")
+        update = status.get("firmwareUpdate")
+        target = update.get("firmware") if isinstance(update, dict) else None
+        rows.append(
+            {
+                "collarId": status.get("collarId"),
+                "serialNumber": status.get("serialNumber"),
+                "installedVersion": (
+                    installed.get("formattedVersion") or installed.get("version")
+                    if isinstance(installed, dict)
+                    else None
+                ),
+                "targetVersion": (
+                    target.get("formattedVersion") or target.get("version")
+                    if isinstance(target, dict)
+                    else None
+                ),
+                "updateStatus": status.get("updateStatus") or "idle",
+                "hasFirmwareUpdatesAvailable": status.get(
+                    "hasFirmwareUpdatesAvailable"
+                ),
+                "latestProduction": (
+                    installed.get("firmwareLatestProduction")
+                    if isinstance(installed, dict)
+                    else None
+                ),
+                "latestBeta": (
+                    installed.get("firmwareLatestBeta")
+                    if isinstance(installed, dict)
+                    else None
+                ),
+            }
+        )
+    return rows
+
+
+def _firmware_list(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    statuses = client.firmware_statuses()
+    if args.full:
+        out.emit(statuses)
+        return EXIT_OK
+    out.emit(statuses, rows=_firmware_rows(statuses), columns=FIRMWARE_COLUMNS)
+    return EXIT_OK
+
+
+def _firmware_show(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    out.emit(client.firmware_status(args.collar_id))
     return EXIT_OK
 
 
@@ -1527,8 +2230,278 @@ def _beacon_list(args: argparse.Namespace, client: HaloClient, out: Output) -> i
     return EXIT_OK
 
 
+def _beacon_check_name(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    available = client.beacon_name_is_available(args.name, beacon_id=args.beacon_id)
+    result = {"available": available}
+    out.emit(result, pairs=result)
+    return EXIT_OK
+
+
+def _beacon_check_binding(
+    args: argparse.Namespace,
+    client: HaloClient,
+    out: Output,
+) -> int:
+    out.emit(client.check_beacon_binding(args.serial_number))
+    return EXIT_OK
+
+
+def _beacon_sync(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    out.emit(client.beacon_pet_sync(args.beacon_id))
+    return EXIT_OK
+
+
+def _beacon_range_from_args(args: argparse.Namespace) -> dict[str, int] | None:
+    level = getattr(args, "range_level", None)
+    radius = getattr(args, "radius_in_decibel", None)
+    if (level is None) != (radius is None):
+        raise ValueError("Pass --range-level and --radius-in-decibel together.")
+    if level is None:
+        return None
+    return {"Level": level, "RadiusInDecibel": radius}
+
+
+def _beacon_add(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    if not _confirmed(
+        args,
+        out,
+        warning=(
+            f"\nThis will bind beacon serial {args.serial_number} to the authenticated "
+            "Halo account."
+        ),
+        prompt=f"Type the beacon serial ({args.serial_number}) to bind it: ",
+        expected=args.serial_number,
+        cancelled="Cancelled; the beacon was not added.",
+    ):
+        return EXIT_NO_LOGIN
+    created = client.add_beacon(
+        name=args.name,
+        serial_number=args.serial_number,
+        model_type=args.model_type,
+        action_type=args.action_type,
+        should_notify=args.should_notify,
+        beacon_range=_beacon_range_from_args(args),
+        is_enabled=args.is_enabled,
+        transmission_rate_milliseconds=args.transmission_rate_ms,
+        correction_escalation_type=args.correction_escalation_type,
+        pet_id=args.pet_id,
+    )
+    out.note(f"Added beacon {args.name}. Inspect petsSync to follow collar distribution.")
+    out.emit(created)
+    return EXIT_OK
+
+
+def _beacon_update(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    kwargs: dict[str, Any] = {}
+    for cli_name, method_name in (
+        ("name", "name"),
+        ("is_enabled", "is_enabled"),
+        ("action_type", "action_type"),
+        ("should_notify", "should_notify"),
+        ("model_type", "model_type"),
+        ("transmission_rate_ms", "transmission_rate_milliseconds"),
+        ("correction_escalation_type", "correction_escalation_type"),
+        ("pet_id", "pet_id"),
+    ):
+        if hasattr(args, cli_name):
+            kwargs[method_name] = getattr(args, cli_name)
+    has_level = hasattr(args, "range_level")
+    has_radius = hasattr(args, "radius_in_decibel")
+    if has_level != has_radius:
+        raise ValueError("Pass --range-level and --radius-in-decibel together.")
+    if has_level:
+        kwargs["beacon_range"] = {
+            "Level": args.range_level,
+            "RadiusInDecibel": args.radius_in_decibel,
+        }
+    if not kwargs:
+        raise ValueError("Pass at least one beacon setting to update.")
+    if not _confirmed(
+        args,
+        out,
+        warning=f"\nThis will change settings for beacon {args.beacon_id}.",
+        prompt=f"Type the beacon id ({args.beacon_id}) to update it: ",
+        expected=args.beacon_id,
+        cancelled="Cancelled; the beacon was not updated.",
+    ):
+        return EXIT_NO_LOGIN
+    updated = client.update_beacon(args.beacon_id, **kwargs)
+    out.note(f"Updated beacon {args.beacon_id}.")
+    out.emit(updated)
+    return EXIT_OK
+
+
+def _beacon_delete(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    if not _confirmed(
+        args,
+        out,
+        warning=f"\nThis will delete or unbind beacon {args.beacon_id}.",
+        prompt=f"Type the beacon id ({args.beacon_id}) to delete it: ",
+        expected=args.beacon_id,
+        cancelled="Cancelled; the beacon was not deleted.",
+    ):
+        return EXIT_NO_LOGIN
+    client.delete_beacon(args.beacon_id)
+    out.note(f"Deleted beacon {args.beacon_id}. Refresh the list to confirm removal.")
+    return EXIT_OK
+
+
+def _beacon_telemetry(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    value = _read_json_value(args.readings_file, "beacon telemetry")
+    if isinstance(value, dict):
+        value = value.get("BeaconsTelemetry")
+    if not isinstance(value, list):
+        raise ValueError(
+            "Beacon telemetry must be a JSON array or an object containing BeaconsTelemetry."
+        )
+    client.upload_beacon_telemetry(value)
+    out.note("Uploaded beacon battery telemetry to Halo.")
+    return EXIT_OK
+
+
 def _walk_list(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
     out.emit(client.walks(page=args.page, page_size=args.page_size))
+    return EXIT_OK
+
+
+def _walk_summary(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    out.emit(client.walk_summary(args.walk_id))
+    return EXIT_OK
+
+
+def _walk_collar_command_confirmed(
+    args: argparse.Namespace,
+    out: Output,
+    action: str,
+) -> bool:
+    past_tense = {"pause": "paused", "resume": "resumed", "stop": "stopped"}[action]
+    return _confirmed(
+        args,
+        out,
+        warning=(
+            f"\nThis will {action} collar {args.collar_id} for walk {args.walk_id}. "
+            "Cloud acknowledgement does not prove the collar applied it."
+        ),
+        prompt=f"Type the collar id ({args.collar_id}) to send the command: ",
+        expected=args.collar_id,
+        cancelled=f"Cancelled; the walk was not {past_tense}.",
+    )
+
+
+def _walk_set_paused(
+    args: argparse.Namespace,
+    client: HaloClient,
+    out: Output,
+    *,
+    paused: bool,
+) -> int:
+    action = "pause" if paused else "resume"
+    if not _walk_collar_command_confirmed(args, out, action):
+        return EXIT_NO_LOGIN
+    response = client.set_walk_paused(args.walk_id, args.collar_id, paused)
+    out.note(
+        f"Halo acknowledged the {action} request. Confirm telemetry.walk.isPaused "
+        "before treating it as applied."
+    )
+    out.emit(response)
+    return EXIT_OK
+
+
+def _walk_pause(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    return _walk_set_paused(args, client, out, paused=True)
+
+
+def _walk_resume(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    return _walk_set_paused(args, client, out, paused=False)
+
+
+def _walk_stop(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    if not _walk_collar_command_confirmed(args, out, "stop"):
+        return EXIT_NO_LOGIN
+    response = client.stop_walk(
+        args.walk_id,
+        args.collar_id,
+        stop_option=args.stop_option,
+    )
+    out.note(
+        "Halo acknowledged the stop request. Confirm fresh collar telemetry reports "
+        "walk=null; this does not finalize the overall walk."
+    )
+    out.emit(response)
+    return EXIT_OK
+
+
+def _read_json_value(path_value: str, description: str) -> Any:
+    path = Path(path_value)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"Cannot read {description} at {path}.") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{description.title()} at {path} is not valid JSON.") from exc
+
+
+def _read_json_object(path_value: str, description: str) -> dict[str, Any]:
+    value = _read_json_value(path_value, description)
+    if not isinstance(value, dict):
+        raise ValueError(f"{description.title()} must contain one JSON object.")
+    return value
+
+
+def _walk_mark_ended(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    summary = _read_json_object(args.summary_file, "walk summary")
+    required = ("StartedAt", "EndedAt", "Pets", "User", "LocationName")
+    missing = [key for key in required if key not in summary]
+    if missing:
+        raise ValueError(f"Walk summary is missing: {', '.join(missing)}.")
+    client.mark_walk_ended(
+        args.walk_id,
+        started_at=summary["StartedAt"],
+        ended_at=summary["EndedAt"],
+        pets=summary["Pets"],
+        user=summary["User"],
+        location_name=summary["LocationName"],
+    )
+    out.note(
+        "Submitted the completed walk summary. Trail images are separate uploads "
+        "and may become visible later."
+    )
+    return EXIT_OK
+
+
+def _read_image(path_value: str) -> tuple[Path, bytes]:
+    path = Path(path_value)
+    try:
+        image = path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"Cannot read walk image at {path}.") from exc
+    if not image:
+        raise ValueError(f"Walk image at {path} is empty.")
+    return path, image
+
+
+def _walk_upload_thumbnail(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    path, image = _read_image(args.image_file)
+    client.upload_walk_trail_thumbnail(
+        args.walk_id,
+        image,
+        filename=path.name,
+        content_type=args.content_type,
+    )
+    out.note("Uploaded the overall trail thumbnail; processing may finish later.")
+    return EXIT_OK
+
+
+def _walk_upload_pet_image(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    path, image = _read_image(args.image_file)
+    client.upload_walk_pet_trail_image(
+        args.walk_id,
+        args.pet_id,
+        image,
+        filename=path.name,
+        content_type=args.content_type,
+    )
+    out.note("Uploaded the pet trail image; processing may finish later.")
     return EXIT_OK
 
 
@@ -1660,6 +2633,108 @@ def _correction_rules(args: argparse.Namespace, client: HaloClient, out: Output)
 def _correction_config(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
     out.emit(client.correction_rule_configuration())
     return EXIT_OK
+
+
+def _correction_update(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    item = _correction_update_item(args)
+    if not _confirmed(
+        args,
+        out,
+        warning=(
+            f"\nThis will change persistent correction rule {args.rule_id} to "
+            f"{CorrectionRuleKindType.parse(args.kind_type).value}. Future collar "
+            "behavior can change after configuration synchronization."
+        ),
+        prompt=f"Type the rule id ({args.rule_id}) to update it: ",
+        expected=args.rule_id,
+        cancelled="Cancelled; the correction rule was not changed.",
+    ):
+        return EXIT_NO_LOGIN
+    updated = client.update_correction_rules([item])
+    out.note(
+        f"Halo stored correction rule {args.rule_id}. Verify it with `halo correction "
+        "rules PET_ID`, then wait for the collar's configurationSyncStatus to become "
+        "uptodate."
+    )
+    out.emit(updated)
+    return EXIT_OK
+
+
+def _correction_test(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    if args.expires_in < 1:
+        raise ValueError("--expires-in must be at least 1 second.")
+    item = _correction_update_item(
+        argparse.Namespace(
+            rule_id="test-only",
+            kind_type=args.kind_type,
+            level=args.level,
+            sound_id=args.sound_id,
+            vibration_id=args.vibration_id,
+        )
+    )
+    pet = client.pet(args.pet_id)
+    pet_name = str(pet.get("name") or args.pet_id)
+    if not _confirmed(
+        args,
+        out,
+        warning=(
+            f"\nThis will send one {CorrectionRuleKindType.parse(args.kind_type).value} "
+            f"test directly to {pet_name}'s collar. It does not save the rule.\n"
+            "Remove the collar from the dog and start with the lowest safe feedback level."
+        ),
+        prompt=f"Type the pet name ({pet_name}) to test exactly once: ",
+        expected=pet_name,
+        cancelled="Cancelled; no collar test was sent.",
+    ):
+        return EXIT_NO_LOGIN
+    kind = CorrectionRuleKindType.parse(item.kind_type)
+    result = client.test_correction_on_collar(
+        args.pet_id,
+        kind,
+        sound_id=item.sound_id,
+        vibration_id=item.vibration_id,
+        sound_intensity_level=item.level if kind is CorrectionRuleKindType.SOUND else None,
+        shock_intensity_level=item.level if kind is CorrectionRuleKindType.SHOCK else None,
+        command_number=args.command_number,
+        expiration_seconds=args.expires_in,
+        require_online=not args.skip_online_check,
+    )
+    out.note(
+        f"Halo accepted the {kind.value} collar test for {pet_name}. "
+        "Cloud acceptance does not confirm physical execution or save a rule."
+    )
+    if result.get("currentCommandNumber") is not None:
+        out.note(f"Halo current command number: {result['currentCommandNumber']}")
+    out.emit(result)
+    return EXIT_OK
+
+
+def _correction_update_item(args: argparse.Namespace) -> CorrectionRuleUpdate:
+    kind = CorrectionRuleKindType.parse(args.kind_type)
+    if args.level is not None and args.level < 1:
+        raise ValueError("--level must be at least 1.")
+    if kind is CorrectionRuleKindType.SOUND:
+        if not args.sound_id:
+            raise ValueError("Sound requires --sound-id from `halo correction config`.")
+        if args.vibration_id:
+            raise ValueError("Sound cannot be combined with --vibration-id.")
+    elif kind is CorrectionRuleKindType.VIBRATION:
+        if not args.vibration_id:
+            raise ValueError("Vibration requires --vibration-id from `halo correction config`.")
+        if args.sound_id or args.level is not None:
+            raise ValueError("Vibration cannot be combined with --sound-id or --level.")
+    else:
+        if args.level is None:
+            raise ValueError("Shock requires --level from `halo correction config`.")
+        if args.sound_id or args.vibration_id:
+            raise ValueError("Shock cannot be combined with sound or vibration IDs.")
+    return CorrectionRuleUpdate(
+        correction_rule_id=args.rule_id,
+        kind_type=kind,
+        level=args.level,
+        sound_id=args.sound_id,
+        vibration_id=args.vibration_id,
+    )
 
 
 def _training_show(args: argparse.Namespace, client: HaloClient, out: Output) -> int:

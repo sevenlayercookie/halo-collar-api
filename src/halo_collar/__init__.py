@@ -25,7 +25,18 @@ from .errors import (
     StaleCommandNumberError,
     UnsafeCorrectionError,
 )
-from .models import AuthorizationFlow, CorrectionType, TokenSet
+from .models import (
+    AuthorizationFlow,
+    BeaconActionType,
+    BeaconCorrectionEscalationType,
+    BeaconModelType,
+    CorrectionRuleKindType,
+    CorrectionRuleUpdate,
+    CorrectionType,
+    FirmwareUpdateStatus,
+    TokenSet,
+    WalkStopOption,
+)
 from .signalr import HaloSignalRClient, SignalREvent, SignalRHub
 from .storage import StateStore
 
@@ -34,9 +45,15 @@ __all__ = [
     "ANDROID_CLIENT_SECRET",
     "ANDROID_PROFILE",
     "AuthorizationFlow",
+    "BeaconActionType",
+    "BeaconCorrectionEscalationType",
+    "BeaconModelType",
     "CommandCounterUnknownError",
     "CorrectionOutcomeUnknownError",
+    "CorrectionRuleKindType",
+    "CorrectionRuleUpdate",
     "CorrectionType",
+    "FirmwareUpdateStatus",
     "HaloAPIError",
     "HaloClient",
     "HaloError",
@@ -58,4 +75,5 @@ __all__ = [
     "StateStore",
     "TokenSet",
     "UnsafeCorrectionError",
+    "WalkStopOption",
 ]

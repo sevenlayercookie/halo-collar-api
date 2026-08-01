@@ -8,6 +8,8 @@ import pytest
 
 from halo_collar import (
     ANDROID_CLIENT_SECRET,
+    CorrectionRuleKindType,
+    CorrectionRuleUpdate,
     SignalREvent,
     SignalRHub,
     TokenSet,
@@ -102,7 +104,18 @@ def test_a_noun_without_a_verb_shows_that_nouns_help(capsys) -> None:
 
     out = capsys.readouterr().out
     assert "halo pet" in out
-    for verb in ("list", "show", "add", "update", "delete", "colors"):
+    for verb in (
+        "list",
+        "show",
+        "add",
+        "update",
+        "delete",
+        "bind-collar",
+        "unbind-collar",
+        "colors",
+        "fences",
+        "beacons",
+    ):
         assert verb in out
 
 
@@ -110,7 +123,59 @@ def test_collar_help_lists_binding_commands(capsys) -> None:
     assert cli.main(["collar"]) == 0
 
     out = capsys.readouterr().out
-    for verb in ("list", "locate", "check-binding", "bind"):
+    for verb in ("list", "show", "locate", "check-binding", "bind", "remove"):
+        assert verb in out
+
+
+def test_firmware_help_is_read_only(capsys) -> None:
+    assert cli.main(["firmware"]) == 0
+
+    out = capsys.readouterr().out
+    assert "    list" in out
+    assert "    show" in out
+    assert "    start" not in out
+    assert "    cancel" not in out
+
+
+def test_beacon_help_lists_management_commands(capsys) -> None:
+    assert cli.main(["beacon"]) == 0
+
+    out = capsys.readouterr().out
+    for verb in (
+        "list",
+        "check-name",
+        "check-binding",
+        "sync",
+        "add",
+        "update",
+        "delete",
+        "telemetry",
+    ):
+        assert verb in out
+
+
+def test_walk_help_lists_existing_walk_operations(capsys) -> None:
+    assert cli.main(["walk"]) == 0
+
+    out = capsys.readouterr().out
+    for verb in (
+        "list",
+        "summary",
+        "pause",
+        "resume",
+        "stop",
+        "mark-ended",
+        "upload-thumbnail",
+        "upload-pet-image",
+    ):
+        assert verb in out
+
+
+def test_correction_help_lists_rule_editing_and_collar_testing(capsys) -> None:
+    assert cli.main(["correction"]) == 0
+
+    out = capsys.readouterr().out
+    for verb in ("send", "rules", "config", "update", "test"):
         assert verb in out
 
 
@@ -892,6 +957,277 @@ def test_yes_skips_the_prompt_for_scripts(capsys) -> None:
     assert "Deleted Alpha" in capsys.readouterr().err
 
 
+def test_pet_fences_accepts_yes_and_preserves_both_modes(capsys) -> None:
+    response = {
+        "desiredMode": {"fencesOn": False, "beaconsOn": True},
+        "telemetry": {"mode": {"fencesOn": True, "beaconsOn": True}},
+    }
+
+    class FakeClient:
+        def set_pet_fences_enabled(self, pet_id, enabled):
+            assert pet_id == "pet-1"
+            assert enabled is False
+            return response
+
+    assert (
+        cli._pet_fences(
+            args(pet_id="pet-1", state="off", yes=True),
+            FakeClient(),
+            Output(as_json=True),
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == response
+    assert "Compare desiredMode with telemetry.mode" in captured.err
+
+
+@pytest.mark.parametrize(("state", "expected"), [("on", True), ("off", False)])
+def test_pet_beacons_maps_cli_state_to_boolean(capsys, state, expected) -> None:
+    class FakeClient:
+        def set_pet_beacons_assigned(self, pet_id, assigned):
+            assert pet_id == "pet-1"
+            assert assigned is expected
+            return None
+
+    assert (
+        cli._pet_beacons(
+            args(pet_id="pet-1", state=state, yes=True),
+            FakeClient(),
+            Output(as_json=True),
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"beacon assignment {state}" in captured.err
+
+
+@pytest.mark.parametrize(("handler", "state"), [(cli._pet_fences, "off"), (cli._pet_beacons, "on")])
+def test_pet_mode_changes_need_confirmation_without_a_terminal(handler, state) -> None:
+    class FakeClient:
+        def __getattr__(self, _):
+            return lambda *_: pytest.fail("pet mode should not be changed")
+
+    with pytest.raises(ValueError, match="--yes"):
+        handler(
+            args(pet_id="pet-1", state=state, yes=False, no_input=True),
+            FakeClient(),
+            Output(),
+        )
+
+
+def test_beacon_checks_and_sync_emit_complete_results(capsys) -> None:
+    class FakeClient:
+        def beacon_name_is_available(self, name, *, beacon_id):
+            assert (name, beacon_id) == ("Kitchen", "beacon-1")
+            return False
+
+        def check_beacon_binding(self, serial_number):
+            assert serial_number == "SERIAL"
+            return {"result": True}
+
+        def beacon_pet_sync(self, beacon_id):
+            assert beacon_id == "beacon-1"
+            return [{"petId": "pet-1", "status": "completed", "isAssigned": True}]
+
+    client = FakeClient()
+    assert (
+        cli._beacon_check_name(
+            args(name="Kitchen", beacon_id="beacon-1"),
+            client,
+            Output(as_json=True),
+        )
+        == 0
+    )
+    assert (
+        cli._beacon_check_binding(
+            args(serial_number="SERIAL"),
+            client,
+            Output(as_json=True),
+        )
+        == 0
+    )
+    assert (
+        cli._beacon_sync(
+            args(beacon_id="beacon-1"),
+            client,
+            Output(as_json=True),
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    decoder = json.JSONDecoder()
+    values = []
+    while output.strip():
+        value, index = decoder.raw_decode(output)
+        values.append(value)
+        output = output[index:].lstrip()
+    assert values == [
+        {"available": False},
+        {"result": True},
+        [{"petId": "pet-1", "status": "completed", "isAssigned": True}],
+    ]
+
+
+def test_beacon_add_builds_range_and_accepts_yes(capsys) -> None:
+    class FakeClient:
+        def add_beacon(self, **kwargs):
+            assert kwargs == {
+                "name": "Kitchen",
+                "serial_number": "SERIAL",
+                "model_type": "Usb",
+                "action_type": "KeepAway",
+                "should_notify": True,
+                "beacon_range": {"Level": 3, "RadiusInDecibel": -50},
+                "is_enabled": True,
+                "transmission_rate_milliseconds": 1000,
+                "correction_escalation_type": "Warning",
+                "pet_id": "pet-1",
+            }
+            return {"id": "beacon-1", "name": "Kitchen"}
+
+    assert (
+        cli._beacon_add(
+            args(
+                name="Kitchen",
+                serial_number="SERIAL",
+                model_type="Usb",
+                action_type="KeepAway",
+                should_notify=True,
+                is_enabled=True,
+                range_level=3,
+                radius_in_decibel=-50,
+                transmission_rate_ms=1000,
+                correction_escalation_type="Warning",
+                pet_id="pet-1",
+                yes=True,
+            ),
+            FakeClient(),
+            Output(as_json=True),
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"id": "beacon-1", "name": "Kitchen"}
+    assert "Inspect petsSync" in captured.err
+
+
+def test_beacon_update_sends_only_cli_fields_that_were_present(capsys) -> None:
+    class FakeClient:
+        def update_beacon(self, beacon_id, **kwargs):
+            assert beacon_id == "beacon-1"
+            assert kwargs == {
+                "name": "Back Door",
+                "action_type": "IgnoreFences",
+                "beacon_range": {"Level": 5, "RadiusInDecibel": -57},
+            }
+            return {"id": "beacon-1", "name": "Back Door"}
+
+    assert (
+        cli._beacon_update(
+            args(
+                beacon_id="beacon-1",
+                name="Back Door",
+                action_type="IgnoreFences",
+                range_level=5,
+                radius_in_decibel=-57,
+                yes=True,
+            ),
+            FakeClient(),
+            Output(as_json=True),
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["name"] == "Back Door"
+    assert "Updated beacon beacon-1" in captured.err
+
+
+def test_beacon_update_rejects_a_no_op_before_confirmation() -> None:
+    with pytest.raises(ValueError, match="at least one"):
+        cli._beacon_update(
+            args(beacon_id="beacon-1", yes=False, no_input=True),
+            object(),
+            Output(),
+        )
+
+
+def test_beacon_delete_accepts_yes(capsys) -> None:
+    deleted = []
+
+    class FakeClient:
+        def delete_beacon(self, beacon_id):
+            deleted.append(beacon_id)
+
+    assert (
+        cli._beacon_delete(
+            args(beacon_id="beacon-1", yes=True),
+            FakeClient(),
+            Output(),
+        )
+        == 0
+    )
+    assert deleted == ["beacon-1"]
+    assert "confirm removal" in capsys.readouterr().err
+
+
+def test_beacon_telemetry_reads_a_json_file(tmp_path, capsys) -> None:
+    readings = [{"SerialNumber": "SERIAL", "BatteryChargePercent": 85}]
+    path = tmp_path / "telemetry.json"
+    path.write_text(json.dumps(readings))
+
+    class FakeClient:
+        def upload_beacon_telemetry(self, value):
+            assert value == readings
+
+    assert (
+        cli._beacon_telemetry(
+            args(readings_file=str(path)),
+            FakeClient(),
+            Output(),
+        )
+        == 0
+    )
+    assert "Uploaded beacon battery telemetry" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("handler", "command_args"),
+    [
+        (
+            cli._beacon_add,
+            {
+                "name": "Kitchen",
+                "serial_number": "SERIAL",
+                "model_type": "Usb",
+                "action_type": "KeepAway",
+                "should_notify": True,
+                "is_enabled": None,
+                "range_level": None,
+                "radius_in_decibel": None,
+                "transmission_rate_ms": None,
+                "correction_escalation_type": None,
+                "pet_id": None,
+            },
+        ),
+        (cli._beacon_update, {"beacon_id": "beacon-1", "name": "Kitchen"}),
+        (cli._beacon_delete, {"beacon_id": "beacon-1"}),
+    ],
+)
+def test_beacon_mutations_need_confirmation(handler, command_args) -> None:
+    class FakeClient:
+        def __getattr__(self, _):
+            return lambda *_args, **_kwargs: pytest.fail("beacon mutation should not be sent")
+
+    with pytest.raises(ValueError, match="--yes"):
+        handler(
+            args(**command_args, yes=False, no_input=True),
+            FakeClient(),
+            Output(),
+        )
+
+
 def test_collar_check_binding_emits_the_complete_result(capsys) -> None:
     response = {
         "result": False,
@@ -963,6 +1299,519 @@ def test_collar_bind_needs_confirmation_without_a_terminal() -> None:
             FakeClient(),
             Output(),
         )
+
+
+def test_collar_show_emits_the_complete_relationship(capsys) -> None:
+    response = {"id": "collar-1", "petInfo": {"id": "pet-1", "name": "Scout"}}
+
+    class FakeClient:
+        def collar(self, collar_id):
+            assert collar_id == "collar-1"
+            return response
+
+    assert (
+        cli._collar_show(
+            args(collar_id="collar-1"),
+            FakeClient(),
+            Output(as_json=True),
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out) == response
+
+
+def test_pet_bind_collar_accepts_yes_and_explains_verification(capsys) -> None:
+    calls = []
+
+    class FakeClient:
+        def bind_collar_to_pet(self, pet_id, collar_id):
+            calls.append((pet_id, collar_id))
+
+    assert (
+        cli._pet_bind_collar(
+            args(pet_id="pet-1", collar_id="collar-1", yes=True),
+            FakeClient(),
+            Output(),
+        )
+        == 0
+    )
+    assert calls == [("pet-1", "collar-1")]
+    notice = capsys.readouterr().err
+    assert "halo pet show pet-1 --refresh-telemetry" in notice
+    assert "halo collar show collar-1" in notice
+
+
+def test_pet_unbind_collar_accepts_yes_and_keeps_account_binding(capsys) -> None:
+    calls = []
+
+    class FakeClient:
+        def unbind_collar_from_pet(self, pet_id):
+            calls.append(pet_id)
+
+    assert (
+        cli._pet_unbind_collar(
+            args(pet_id="pet-1", yes=True),
+            FakeClient(),
+            Output(),
+        )
+        == 0
+    )
+    assert calls == ["pet-1"]
+    assert "collarInfo=null" in capsys.readouterr().err
+
+
+def test_collar_remove_accepts_yes_and_warns_about_confirmation(capsys) -> None:
+    calls = []
+
+    class FakeClient:
+        def unbind_collar_from_user(self, collar_id):
+            calls.append(collar_id)
+
+    assert (
+        cli._collar_remove(
+            args(collar_id="collar-1", yes=True),
+            FakeClient(),
+            Output(),
+        )
+        == 0
+    )
+    assert calls == ["collar-1"]
+    assert "absent from `halo collar list`" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("handler", "command_args"),
+    [
+        (cli._pet_bind_collar, {"pet_id": "pet-1", "collar_id": "collar-1"}),
+        (cli._pet_unbind_collar, {"pet_id": "pet-1"}),
+        (cli._collar_remove, {"collar_id": "collar-1"}),
+    ],
+)
+def test_collar_relationship_mutations_need_confirmation(handler, command_args) -> None:
+    class FakeClient:
+        def __getattr__(self, _):
+            return lambda *_args, **_kwargs: pytest.fail("mutation should not be sent")
+
+    with pytest.raises(ValueError, match="--yes"):
+        handler(
+            args(**command_args, yes=False, no_input=True),
+            FakeClient(),
+            Output(),
+        )
+
+
+def test_firmware_list_summarizes_and_preserves_full_status(capsys) -> None:
+    statuses = [
+        {
+            "collarId": "collar-1",
+            "serialNumber": "SERIAL-1",
+            "firmware": {
+                "version": "03.08.00",
+                "formattedVersion": "03.08.00",
+                "features": ["fota"],
+                "firmwareLatestProduction": False,
+                "firmwareLatestBeta": False,
+            },
+            "hasFirmwareUpdatesAvailable": True,
+            "firmwareUpdate": {
+                "firmware": {"version": "03.09.00"},
+                "update": {"status": "downloading"},
+            },
+            "updateStatus": "downloading",
+        }
+    ]
+
+    class FakeClient:
+        def firmware_statuses(self):
+            return statuses
+
+    assert cli._firmware_list(args(full=False), FakeClient(), Output()) == 0
+    summary = capsys.readouterr().out
+    assert "03.08.00" in summary
+    assert "03.09.00" in summary
+    assert "downloading" in summary
+    assert "fota" not in summary
+
+    assert (
+        cli._firmware_list(
+            args(full=True),
+            FakeClient(),
+            Output(as_json=True),
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out) == statuses
+
+
+def test_firmware_show_emits_one_complete_status(capsys) -> None:
+    status = {
+        "collarId": "collar-1",
+        "firmware": {"version": "03.08.00"},
+        "firmwareUpdate": None,
+        "updateStatus": None,
+    }
+
+    class FakeClient:
+        def firmware_status(self, collar_id):
+            assert collar_id == "collar-1"
+            return status
+
+    assert (
+        cli._firmware_show(
+            args(collar_id="collar-1"),
+            FakeClient(),
+            Output(as_json=True),
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out) == status
+
+
+def test_correction_update_sends_one_identified_rule(capsys) -> None:
+    response = {
+        "correctionRules": [{"id": "rule-1", "kindType": "sound"}],
+        "lastCorrectionRulesUpdated": "2026-07-30T18:42:00Z",
+    }
+
+    class FakeClient:
+        def update_correction_rules(self, items):
+            assert items == [
+                CorrectionRuleUpdate(
+                    "rule-1",
+                    CorrectionRuleKindType.SOUND,
+                    level=3,
+                    sound_id="sound-1",
+                )
+            ]
+            return response
+
+    assert (
+        cli._correction_update(
+            args(
+                rule_id="rule-1",
+                kind_type="Sound",
+                level=3,
+                sound_id="sound-1",
+                vibration_id=None,
+                yes=True,
+            ),
+            FakeClient(),
+            Output(as_json=True),
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == response
+    assert "configurationSyncStatus" in captured.err
+
+
+def test_correction_test_passes_direct_command_safety_options(capsys) -> None:
+    response = {"result": "success", "currentCommandNumber": 13}
+
+    class FakeClient:
+        def pet(self, pet_id):
+            assert pet_id == "pet-1"
+            return {"id": pet_id, "name": "Scout"}
+
+        def test_correction_on_collar(self, pet_id, kind_type, **kwargs):
+            assert pet_id == "pet-1"
+            assert kind_type is CorrectionRuleKindType.SHOCK
+            assert kwargs == {
+                "sound_id": None,
+                "vibration_id": None,
+                "sound_intensity_level": None,
+                "shock_intensity_level": 1,
+                "command_number": 13,
+                "expiration_seconds": 20,
+                "require_online": False,
+            }
+            return response
+
+    assert (
+        cli._correction_test(
+            args(
+                pet_id="pet-1",
+                kind_type="Shock",
+                level=1,
+                sound_id=None,
+                vibration_id=None,
+                command_number=13,
+                expires_in=20,
+                skip_online_check=True,
+                yes=True,
+            ),
+            FakeClient(),
+            Output(as_json=True),
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == response
+    assert "does not confirm physical execution or save a rule" in captured.err
+
+
+@pytest.mark.parametrize(
+    "command_args",
+    [
+        {
+            "rule_id": "rule-1",
+            "kind_type": "Sound",
+            "level": 3,
+            "sound_id": None,
+            "vibration_id": None,
+        },
+        {
+            "rule_id": "rule-1",
+            "kind_type": "Vibration",
+            "level": 1,
+            "sound_id": None,
+            "vibration_id": "vibration-1",
+        },
+        {
+            "rule_id": "rule-1",
+            "kind_type": "Shock",
+            "level": 0,
+            "sound_id": None,
+            "vibration_id": None,
+        },
+    ],
+)
+def test_correction_update_rejects_invalid_modality_options(command_args) -> None:
+    class FakeClient:
+        def update_correction_rules(self, _):
+            pytest.fail("invalid correction rule should not be sent")
+
+    with pytest.raises(ValueError):
+        cli._correction_update(
+            args(**command_args, yes=True),
+            FakeClient(),
+            Output(),
+        )
+
+
+def test_correction_rule_writes_need_confirmation() -> None:
+    class FakeClient:
+        def pet(self, pet_id):
+            return {"id": pet_id, "name": "Scout"}
+
+        def update_correction_rules(self, _):
+            pytest.fail("rule update should not be sent")
+
+        def test_correction_on_collar(self, *_args, **_kwargs):
+            pytest.fail("collar test should not be sent")
+
+    client = FakeClient()
+    with pytest.raises(ValueError, match="--yes"):
+        cli._correction_update(
+            args(
+                rule_id="rule-1",
+                kind_type="Shock",
+                level=1,
+                sound_id=None,
+                vibration_id=None,
+                yes=False,
+                no_input=True,
+            ),
+            client,
+            Output(),
+        )
+    with pytest.raises(ValueError, match="--yes"):
+        cli._correction_test(
+            args(
+                pet_id="pet-1",
+                kind_type="Shock",
+                level=1,
+                sound_id=None,
+                vibration_id=None,
+                expires_in=30,
+                command_number=13,
+                skip_online_check=False,
+                yes=False,
+                no_input=True,
+            ),
+            client,
+            Output(),
+        )
+
+
+def test_walk_summary_emits_the_complete_result(capsys) -> None:
+    response = {"id": "walk-1", "startTrigger": "mobile", "endedAt": "2026-07-30T18:41:12Z"}
+
+    class FakeClient:
+        def walk_summary(self, walk_id):
+            assert walk_id == "walk-1"
+            return response
+
+    assert (
+        cli._walk_summary(
+            args(walk_id="walk-1"),
+            FakeClient(),
+            Output(as_json=True),
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out) == response
+
+
+@pytest.mark.parametrize(
+    ("handler", "paused", "action"),
+    [
+        (cli._walk_pause, True, "pause"),
+        (cli._walk_resume, False, "resume"),
+    ],
+)
+def test_walk_pause_and_resume_accept_yes(capsys, handler, paused, action) -> None:
+    class FakeClient:
+        def set_walk_paused(self, walk_id, collar_id, value):
+            assert (walk_id, collar_id, value) == ("walk-1", "collar-1", paused)
+            return {"result": "success"}
+
+    assert (
+        handler(
+            args(walk_id="walk-1", collar_id="collar-1", yes=True),
+            FakeClient(),
+            Output(as_json=True),
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"result": "success"}
+    assert f"{action} request" in captured.err
+    assert "telemetry.walk.isPaused" in captured.err
+
+
+def test_walk_stop_passes_the_selected_option(capsys) -> None:
+    class FakeClient:
+        def stop_walk(self, walk_id, collar_id, *, stop_option):
+            assert (walk_id, collar_id) == ("walk-1", "collar-1")
+            assert stop_option == "ForceKeepFencesMode"
+            return {"result": "success"}
+
+    assert (
+        cli._walk_stop(
+            args(
+                walk_id="walk-1",
+                collar_id="collar-1",
+                stop_option="ForceKeepFencesMode",
+                yes=True,
+            ),
+            FakeClient(),
+            Output(as_json=True),
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"result": "success"}
+    assert "walk=null" in captured.err
+
+
+@pytest.mark.parametrize("handler", [cli._walk_pause, cli._walk_resume, cli._walk_stop])
+def test_walk_collar_commands_need_confirmation(handler) -> None:
+    class FakeClient:
+        def __getattr__(self, _):
+            return lambda *_args, **_kwargs: pytest.fail("walk command should not be sent")
+
+    command_args = {
+        "walk_id": "walk-1",
+        "collar_id": "collar-1",
+        "yes": False,
+        "no_input": True,
+        "stop_option": "Default",
+    }
+    with pytest.raises(ValueError, match="--yes"):
+        handler(args(**command_args), FakeClient(), Output())
+
+
+def test_walk_mark_ended_reads_the_pascal_case_summary_file(tmp_path, capsys) -> None:
+    summary = {
+        "StartedAt": "2026-07-30T18:10:00Z",
+        "EndedAt": "2026-07-30T18:41:12Z",
+        "Pets": [{"Id": "pet-1", "CollarId": "collar-1"}],
+        "User": {"TotalDuration": "00:31:12"},
+        "LocationName": "Rochester, Minnesota",
+    }
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text(json.dumps(summary))
+
+    class FakeClient:
+        def mark_walk_ended(self, walk_id, **kwargs):
+            assert walk_id == "walk-1"
+            assert kwargs == {
+                "started_at": summary["StartedAt"],
+                "ended_at": summary["EndedAt"],
+                "pets": summary["Pets"],
+                "user": summary["User"],
+                "location_name": summary["LocationName"],
+            }
+
+    assert (
+        cli._walk_mark_ended(
+            args(walk_id="walk-1", summary_file=str(summary_path)),
+            FakeClient(),
+            Output(),
+        )
+        == 0
+    )
+    assert "Submitted the completed walk summary" in capsys.readouterr().err
+
+
+def test_walk_image_handlers_read_files_and_preserve_names(tmp_path, capsys) -> None:
+    thumbnail = tmp_path / "overview.jpg"
+    pet_image = tmp_path / "pet-trail.png"
+    thumbnail.write_bytes(b"overview")
+    pet_image.write_bytes(b"pet-trail")
+    calls = []
+
+    class FakeClient:
+        def upload_walk_trail_thumbnail(self, walk_id, image, **kwargs):
+            calls.append(("thumbnail", walk_id, image, kwargs))
+
+        def upload_walk_pet_trail_image(self, walk_id, pet_id, image, **kwargs):
+            calls.append(("pet", walk_id, pet_id, image, kwargs))
+
+    client = FakeClient()
+    assert (
+        cli._walk_upload_thumbnail(
+            args(
+                walk_id="walk-1",
+                image_file=str(thumbnail),
+                content_type="image/jpeg",
+            ),
+            client,
+            Output(),
+        )
+        == 0
+    )
+    assert (
+        cli._walk_upload_pet_image(
+            args(
+                walk_id="walk-1",
+                pet_id="pet-1",
+                image_file=str(pet_image),
+                content_type="image/png",
+            ),
+            client,
+            Output(),
+        )
+        == 0
+    )
+
+    assert calls == [
+        (
+            "thumbnail",
+            "walk-1",
+            b"overview",
+            {"filename": "overview.jpg", "content_type": "image/jpeg"},
+        ),
+        (
+            "pet",
+            "walk-1",
+            "pet-1",
+            b"pet-trail",
+            {"filename": "pet-trail.png", "content_type": "image/png"},
+        ),
+    ]
+    assert "processing may finish later" in capsys.readouterr().err
 
 
 def test_pet_delete_cancels_unless_the_name_is_typed(monkeypatch, capsys, interactive) -> None:

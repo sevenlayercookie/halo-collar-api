@@ -21,30 +21,32 @@ Implemented functionality:
 - Refresh-token login and automatic access-token refresh/rotation
 - Public application configuration
 - Account collars and connectivity
+- Read-only installed firmware and server-managed update progress
 - Pet listing (including collarless pets), details, creation, editing, and
   optional telemetry refresh, plus containment and beacon mode changes
 - The aggregate map view, geofence create/rename/move/delete, and safe-zone preview
-- User profile, beacons, subscription, and in-app notifications
-- Walk history, notification history, and marking notifications read
-- Correction rules and the sound/vibration intensity catalog
+- User profile, complete beacon management, subscription, and in-app notifications
+- Walk history, remote pause/stop commands, completed-walk submission and images
+- Notification history and marking notifications read
+- Correction-rule reading/editing and the sound/vibration intensity catalog
 - Training course progress and course launch links
 - Halo server-clock synchronization
 - Collar locate tone and push-notification registration
-- One-shot instant corrections for the six supported correction enums
+- One-shot instant corrections and unsaved sound/vibration/static collar tests
 - Async SignalR streams for live telemetry, data-state, collar-sync, and
   notification-hub events
 
-BLE rolling codes, DGNSS forwarding, walk recording, beacon creation/editing,
-and collar-to-pet assignment are not implemented.
+BLE rolling codes, DGNSS forwarding, and ordinary walk initiation are not
+implemented.
 
 ## Safety and privacy
 
-An instant correction is a physical action. The server returning `success` means
-the cloud accepted the command; it does not prove the collar executed it. The
-client never retries after a transport failure or ambiguous dispatch. A definite
-HTTP 401 is refreshed and retried once because the API rejected the original
-request before accepting the command. A timeout is reported as an unknown
-outcome.
+An instant correction or direct collar test is a physical action. The server
+returning `success` means the cloud accepted the command; it does not prove the
+collar executed it. The client never retries after a transport failure or
+ambiguous dispatch. A definite HTTP 401 is refreshed and retried once because
+the API rejected the original request before accepting the command. A timeout is
+reported as an unknown outcome.
 
 Before testing a correction:
 
@@ -313,7 +315,7 @@ This plays the collar's locate tone. It is a physical action, but an
 audible-only one — unlike a correction it is not aversive, so no command number
 is reserved and Halo answers `204 No Content`.
 
-## Bind a collar
+## Provision a collar
 
 Check whether the printed serial can be added to the authenticated account:
 
@@ -330,11 +332,78 @@ halo collar bind PRINTED_SERIAL ENCRYPTED_SERIAL
 ```
 
 The bind command asks you to type the printed serial before changing the
-account. Pass `--yes` for an intentional non-interactive call.
+account. Its response contains the server-issued `collar.id`. Attach that UUID,
+not the serial number or ESN, to a pet:
+
+```bash
+halo pet bind-collar PET_ID COLLAR_ID
+halo pet show PET_ID --refresh-telemetry
+halo collar show COLLAR_ID
+```
+
+The empty successful bind response is only an HTTP acknowledgement. Treat the
+attachment as applied when the refreshed pet has the requested `collarInfo.id`
+and `isCollarBindingToPetSynchronized: true`; `petInfo.id` on the collar is the
+reciprocal check.
+
+Detaching a collar from a pet keeps it registered to the account. Removing it
+from the account is a separate operation:
+
+```bash
+halo pet unbind-collar PET_ID
+halo collar remove COLLAR_ID
+```
+
+The account-removal cascade for a collar that is still assigned to a pet has
+not been directly observed. Use the two commands in that order for an explicit
+two-stage removal. All four write commands ask for confirmation; pass `--yes`
+for an intentional non-interactive call. Deleting a pet remains a distinct,
+destructive operation and there is no `DELETE /collar/{id}` route.
+
+## Read firmware status
+
+Firmware rollout is server-managed. The accessible client surface is read-only:
+
+```bash
+halo firmware list
+halo firmware list --full
+halo firmware show COLLAR_ID
+```
+
+These commands use only `GET /collar/my` and `GET /collar/{id}`. The summary
+shows the installed version, target version, asynchronous update state, and the
+server's availability and production/beta markers. `--full` includes complete
+firmware features and nested target metadata.
+
+An active `firmwareUpdate` can report download, verification, delayed, applying,
+failure, or applied states inside an otherwise successful HTTP response. After
+installation, confirm that the installed firmware ID/version changed to the
+target and that `firmwareUpdate` ultimately returned to null. The Notification
+SignalR stream may also carry `FirmwareUpdateIsApplying`,
+`FirmwareUpdateApplied`, or `FirmwareUpdateFailed` notifications:
+
+```bash
+halo live notifications
+```
+
+There is intentionally no firmware start, cancel, package-download, or
+beta/production-selection command. Capability strings such as `fota` and
+`firmwareupdatecancellation` describe the collar; they do not establish a
+customer-facing HTTP operation.
 
 ## Pet containment and beacon modes
 
 Containment fences and beacon assignment use separate operations:
+
+```bash
+halo pet fences PET_ID off
+halo pet beacons PET_ID on
+```
+
+Both commands ask you to type the pet ID before changing collar behavior. Pass
+`--yes` for an intentional non-interactive call.
+
+The equivalent Python methods are:
 
 ```python
 mode = client.set_pet_fences_enabled(pet_id, False)
@@ -349,6 +418,50 @@ additional server fields are preserved without assigning them speculative
 meaning. Turning fences off can disable physical containment; verify the
 collar-reported mode before relying on the change.
 
+## Beacon management
+
+List calls return account beacons together with the server's valid range
+configuration:
+
+```bash
+halo beacon list
+halo beacon check-name Kitchen
+halo beacon check-binding BEACON_SERIAL
+halo beacon sync BEACON_ID
+```
+
+Add, update, and delete require confirmation or `--yes`:
+
+```bash
+halo beacon add --name Kitchen --serial-number BEACON_SERIAL \
+    --model-type Usb --action-type KeepAway --should-notify \
+    --range-level 3 --radius-in-decibel -50
+halo beacon update BEACON_ID --name "Back Door" \
+    --action-type IgnoreFences --range-level 5 --radius-in-decibel -57
+halo beacon delete BEACON_ID
+```
+
+The Python methods are `beacon_name_is_available()`,
+`check_beacon_binding()`, `add_beacon()`, `update_beacon()`, and
+`delete_beacon()`. `update_beacon()` sends only supplied keyword fields;
+explicit `None` sends JSON null, while omission leaves the field out.
+
+Beacon records are account-scoped. `set_pet_beacons_assigned(pet_id, enabled)`
+enables or disables the account's beacon configuration as a whole for one pet;
+it does not select an individual beacon. Poll `beacon_pet_sync(beacon_id)` until
+the pet's status is `completed`. `pending` means distribution is in progress,
+and `skipped` is preserved as a distinct server result.
+
+Phone-discovered battery observations can be uploaded from a JSON array:
+
+```bash
+halo beacon telemetry readings.json
+```
+
+Each element uses PascalCase `SerialNumber` and `BatteryChargePercent`.
+`upload_beacon_telemetry()` updates cloud telemetry only; it does not configure
+the nearby physical beacon.
+
 ## Endpoint coverage
 
 Supported upstream routes:
@@ -356,17 +469,33 @@ Supported upstream routes:
 | Method | Path | Client method |
 | --- | --- | --- |
 | GET | `/configuration/` | `configuration()`, `videos()` |
-| GET | `/collar/my/` | `collars()` |
+| GET | `/collar/my` | `collars()`, `firmware_statuses()` |
+| GET | `/collar/{id}` | `collar()`, `firmware_status()` |
 | PUT | `/collar/check-can-be-bound-to-user` | `check_collar_binding()` |
 | PUT | `/collar/bind-to-user` | `bind_collar()` |
+| POST | `/collar/{id}/unbind-from-user` | `unbind_collar_from_user()` |
 | GET | `/pet/my` | `pets()` |
-| GET | `/pet/{id}/` | `pet()` |
-| GET | `/account/my/map` | `account_map()`, `geofences()` |
+| GET | `/pet/{id}` | `pet()` |
+| PUT | `/pet/{id}/bind-collar` | `bind_collar_to_pet()` |
+| PUT | `/pet/{id}/unbind-collar` | `unbind_collar_from_pet()` |
+| GET | `/account/my/map` | `account_map()`, `geofences()`, `geo_fence_pet_sync()` |
 | POST | `/account/mobile-data` | `register_mobile_device()` |
 | GET | `/user-profile/` | `user_profile()` |
-| GET | `/beacon/my/` | `beacons()` |
+| GET | `/beacon/my` | `beacons()`, `beacon_pet_sync()` |
+| PUT | `/beacon/check-name-uniqueness` | `beacon_name_is_available()` |
+| POST | `/beacon` | `add_beacon()` |
+| PUT | `/beacon/{id}` | `update_beacon()` |
+| DELETE | `/beacon/{id}` | `delete_beacon()` |
+| PUT | `/beacon/telemetry` | `upload_beacon_telemetry()` |
+| PUT | `/beacon/check-can-be-bound-to-user` | `check_beacon_binding()` |
 | GET | `/subscription/my/` | `subscription()` |
 | GET | `/walk/my` | `walks()` |
+| GET | `/walk/{id}/summary` | `walk_summary()` |
+| POST | `/walk/{id}/set-is-paused` | `set_walk_paused()` |
+| POST | `/walk/{id}/stop` | `stop_walk()` |
+| POST | `/walk/{id}/mark-ended` | `mark_walk_ended()` |
+| PUT | `/walk/{id}/trail-thumbnail` | `upload_walk_trail_thumbnail()` |
+| PUT | `/walk/{id}/pet/{petId}/trail-image` | `upload_walk_pet_trail_image()` |
 | GET | `/notification/my/query` | `notifications()` |
 | GET | `/portal-notification/my/in-app/` | `portal_notifications()` |
 | GET | `/mapbox/request/my` | `mapbox_requests()` |
@@ -374,6 +503,8 @@ Supported upstream routes:
 | GET | `/pet/colors` | `pet_colors()` |
 | GET | `/pet/{id}/correction-rules` | `pet_correction_rules()` |
 | GET | `/correction-rule/configuration-v2` | `correction_rule_configuration()` |
+| PUT | `/correction-rule` | `update_correction_rules()` |
+| PUT | `/correction-rule/test-on-collar` | `test_correction_on_collar()` |
 | GET | `/training/my-v2` | `training()` |
 | GET | `/training/user/course-launch-link/{curriculum}/{course}` | `training_course_link()` |
 | POST | `/pet/{id}/run-instant-correction/` | `send_instant_correction()` |
@@ -381,7 +512,7 @@ Supported upstream routes:
 | PUT | `/pet/{id}` | `update_pet()` |
 | DELETE | `/pet/{id}` | `delete_pet()` |
 | PUT | `/pet/{id}/instant-mode` | `set_pet_fences_enabled()` |
-| PUT | `/beacon/set-is-assigned/{id}` | `set_pet_beacons_assigned()` |
+| PUT | `/beacon/set-is-assigned/{petId}` | `set_pet_beacons_assigned()` |
 | PUT | `/pet/check-name-uniqueness` | `pet_name_is_available()` |
 | PUT | `/notification/status` | `set_notification_status()` |
 | POST | `/geo-fence/safe-zones` | `geo_fence_safe_zones()` |
@@ -400,6 +531,9 @@ Paths use the route-specific spelling and trailing slashes expected by the
 upstream API. `/walk/my` pages with `page`/`pageSize` while
 `/notification/my/query` pages with `Page`/`PageSize`; that inconsistency is
 Halo's, not a typo.
+
+Request DTO keys use PascalCase. Response dictionaries retain the lower
+camel-case keys returned by Halo rather than normalizing them.
 
 ### Parallel-call version
 
@@ -439,6 +573,88 @@ pet has no collar until one is bound, so it appears in `halo pet list` but not i
 200 with an empty body rather than returning what it deleted, so nothing here
 undoes it; `halo pet delete` asks you to type the pet's name first.
 
+### Walks
+
+An ordinary phone-started walk cannot be initiated through HTTP. The phone
+generates the walk UUID locally and sends it to participating collars while
+enabling leash mode over Bluetooth. This client deliberately has no
+`start_walk()` method.
+
+Once a walk exists, its HTTP operations are available:
+
+```bash
+halo walk summary WALK_ID
+halo walk pause WALK_ID COLLAR_ID
+halo walk resume WALK_ID COLLAR_ID
+halo walk stop WALK_ID COLLAR_ID --stop-option ForceSetFencesOn
+```
+
+Pause, resume, and stop ask you to type the collar ID. Pass `--yes` for an
+intentional non-interactive command.
+
+```python
+from halo_collar import HaloClient, WalkStopOption
+
+with HaloClient() as halo:
+    halo.set_walk_paused(walk_id, collar_id, True)
+    halo.set_walk_paused(walk_id, collar_id, False)
+    halo.stop_walk(
+        walk_id,
+        collar_id,
+        stop_option=WalkStopOption.FORCE_SET_FENCES_ON,
+    )
+```
+
+Pause and stop return Halo's command-result dictionary unchanged. A
+`result: "success"` acknowledges the command but does not prove that the collar
+applied it. Confirm pause using fresh telemetry for the same walk ID and
+`isPaused`; confirm stop when fresh collar telemetry reports `walk: null`.
+Stopping one collar does not finalize a multi-pet walk.
+
+Finalization submits aggregate PascalCase summary dictionaries, then uploads
+the rendered overall and per-pet trail images separately:
+
+```bash
+halo walk mark-ended WALK_ID summary.json
+halo walk upload-thumbnail WALK_ID overview.png
+halo walk upload-pet-image WALK_ID PET_ID pet-trail.png
+```
+
+The CLI summary file is one JSON object containing `StartedAt`, `EndedAt`,
+`Pets`, `User`, and `LocationName`, with the same nested fields shown below.
+Use `--content-type image/jpeg` when an uploaded file is a JPEG; image commands
+default to `image/png`.
+
+```python
+halo.mark_walk_ended(
+    walk_id,
+    started_at="2026-07-30T18:10:00Z",
+    ended_at="2026-07-30T18:41:12Z",
+    pets=[{
+        "Id": pet_id,
+        "CollarId": collar_id,
+        "WalkedDurationInSeconds": 1815,
+        "WalkedDistanceInMeters": 2431.7,
+        "FeedbacksCount": 2,
+        "Timestamp": "2026-07-30T18:41:10Z",
+    }],
+    user={
+        "TotalDuration": "00:31:12",
+        "WalkedDuration": "00:30:15",
+        "WalkedDistanceInMeters": 2388.4,
+    },
+    location_name="Rochester, Minnesota",
+)
+halo.upload_walk_trail_thumbnail(walk_id, overview_png)
+halo.upload_walk_pet_trail_image(walk_id, pet_id, pet_trail_png)
+```
+
+These requests do not upload raw coordinate arrays. `walk_summary(walk_id)`
+returns the completed summary; `endedAt` confirms summary creation, while
+non-null `trailThumbnailImageUrl` and `pets[].trailImageUrl` confirm that the
+separate images are available. Summary submission and image upload may complete
+at different times.
+
 ### Fences
 
 Halo has no endpoint that lists fences on their own. `geofences()` and `halo
@@ -448,7 +664,8 @@ so listing fences costs one `/account/my/map` call. Note `geoFencesTotalCount`:
 truncated the list.
 
 Fence geometry is a list of `(latitude, longitude)` corners; Halo needs at least
-three. The app previews the derived safe zone while dragging, then saves:
+three. The submitted preview points describe the warning boundary, and Halo
+returns the generated safe-zone geometry before the client saves:
 
 ```python
 points = [(40.0001, -75.0001), (40.0002, -75.00015), (40.0003, -75.00005)]
@@ -457,6 +674,7 @@ with HaloClient() as halo:
     halo.geo_fence_safe_zones(points)          # preview, changes nothing
     halo.geo_fence_name_is_available("Back yard")  # False when taken
     fence = halo.add_geo_fence("Back yard", points)
+    sync = halo.geo_fence_pet_sync(fence["geoFence"]["id"])
 ```
 
 From the CLI, boundary corners are repeated `--point LAT,LON` flags in order,
@@ -474,6 +692,25 @@ the collar corrects the dog, and take effect once the collar syncs. Each CLI
 command asks you to type the fence name or id first, and `--yes` skips that for
 deliberate automation. Halo does not return the boundary that a move or delete
 replaced, so re-drawing it is manual.
+
+Halo fences are account-scoped and automatically associated with the account's
+pets. Each fence's `petsSync` entries describe the distribution result using
+`petId`, `isAssigned`, and a synchronization `status` of `unknown`, `pending`,
+`completed`, or `skipped`. Collared pets progress from `pending` to `completed`.
+For collarless pets, `skipped` is expected and does not by itself mean the fence
+is unassigned. `geo_fence_pet_sync(fence_id)` reads this list.
+
+`currentGeoFenceId` is different: it is a nullable, response-only pet field
+identifying the fence last reported as active by the collar. It may match
+`telemetry.geoFence.id`, but it is not the complete assignment set and is not
+sent by `update_pet`. Multiple account fences can be synchronized to one pet at
+the same time; the collar determines which one it currently reports.
+
+After creating or updating a fence, poll `account_map()` until the relevant
+`petsSync.status` values are `completed` and the pet reports
+`isFencesSynchronized: true`. Granular assignment, unassignment, and
+`currentGeoFenceId` mutation are unsupported and undocumented; the client does
+not guess routes or add these response-only fields to pet updates.
 
 The optional `analytics=` argument carries the app's fence-quality telemetry
 (building proximity warnings and similar). It is accepted but not required, and
@@ -551,6 +788,45 @@ type the pet's name. `--yes` exists for deliberate automation.
 If the official app advanced the counter, Halo returns `oldcommandnumber`. The
 client stores Halo's reported current number but **does not retry**; rerun the
 command only after confirming the action again.
+
+## Edit and test correction rules
+
+Read the pet's rule IDs and the server's current asset/level catalog before
+editing:
+
+```bash
+halo correction rules PET_ID
+halo correction config
+```
+
+Each rule ID already identifies its pet and escalation slot. A single-rule edit
+therefore sends no pet ID or escalation value, and omitted rules are left alone:
+
+```bash
+halo correction update RULE_ID Sound --level 3 --sound-id SOUND_ID
+halo correction update RULE_ID Vibration --vibration-id VIBRATION_ID
+halo correction update RULE_ID Shock --level 1
+```
+
+`Shock` is the HTTP name for static feedback. Every update requires confirmation
+because it changes future collar behavior. A successful response proves the
+server stored the edit, not that the collar installed it. Read the rules again,
+then wait for a fresh collar response whose overall
+`configurationSyncStatus` is `uptodate`; Halo exposes no correction-specific
+applied version or timestamp.
+
+Test a proposed setting without saving it as a rule:
+
+```bash
+halo correction test PET_ID Sound --level 1 --sound-id SOUND_ID --command-number 13
+halo correction test PET_ID Vibration --vibration-id VIBRATION_ID
+halo correction test PET_ID Shock --level 1
+```
+
+The collar test is a one-shot physical command. It checks connectivity, reserves
+the same per-pet command counter used by instant corrections, uses Halo's server
+clock, expires after 30 seconds by default, and is never retried after ambiguous
+dispatch. Remove the collar from the dog and start at the lowest safe level.
 
 ## Python API
 
@@ -644,32 +920,13 @@ client to consume the other hub concurrently.
 Nothing here is implemented. The request shapes for these features are not part
 of this client's supported API.
 
-### Blocked on hardware or conditions we could not reproduce
-
-- **Walk recording.** `GET /walk/my` is covered, but starting and finishing a
-  walk requires a working Bluetooth link to the collar.
-- **Beacon management.** Per-pet assignment is covered, but with no beacon
-  hardware on the account there was nothing to add, rename, or remove.
-- **Collar provisioning.** Pairing a collar, binding it to a pet, and unbinding or
-  deleting one. The app exposes all of these, and a pet carries
-  `isCollarBindingToPetSynchronized` and `isCollarEverAssigned`, but our second pet
-  had no collar to attach.
-
 ### Additional write operations
 
 These fields are returned by supported reads, but their write operations are
 not implemented:
 
-- **Fence assignment.** `currentGeoFenceId` selects which fence applies to a pet;
-  fence CRUD is covered but choosing the active one is not.
-- **Correction rule editing.** `GET /pet/{id}/correction-rules` and
-  `/correction-rule/configuration-v2` are read-only here. Writing them changes
-  what the collar does to the dog, so it warrants confirmation comparable to
-  `send_instant_correction`.
 - **Collar network settings.** `wiFiExtendedSettings` and
   `cellularExtendedSettings`.
-- **Firmware updates.** `hasFirmwareUpdatesAvailable` and `firmwareUpdate`; the
-  firmware feature list also advertises `fota`.
 - **Calibration.** The firmware advertises `gpscalibration`,
   `compasscalibration`, and `manualgpscalibration`.
 - **Account/profile edits** implied by `hasChangeEmailRequest`,
@@ -682,7 +939,9 @@ not implemented:
   scheduling settings. Note that this client already requests the `api.dogpark`
   OAuth scope at login but never uses it.
 - **BLE.** Rolling codes and direct collar communication, used when the collar is
-  in range and for setup.
+  in range, for setup, and to initiate an ordinary phone-started walk. HTTP can
+  pause, stop, finalize, and retrieve an existing walk but cannot reproduce that
+  start sequence.
 - **Training content.** `training_course_link()` returns a SCORM launch URL that
   sets CloudFront signed cookies; the videos behind it are HLS with AES keys
   under separate signed URLs. Downloading them means following that chain rather

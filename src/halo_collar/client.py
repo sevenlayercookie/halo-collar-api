@@ -28,13 +28,24 @@ from .errors import (
     StaleCommandNumberError,
     UnsafeCorrectionError,
 )
-from .models import CorrectionType, TokenSet
+from .models import (
+    BeaconActionType,
+    BeaconCorrectionEscalationType,
+    BeaconModelType,
+    CorrectionRuleKindType,
+    CorrectionRuleUpdate,
+    CorrectionType,
+    FirmwareUpdateStatus,
+    TokenSet,
+    WalkStopOption,
+)
 from .storage import StateStore
 
 API_BASE_URL = "https://api.halocollar.com"
 DEFAULT_MOBILE_ID = 2
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _UNKNOWN_PARALLEL_CALL_VERSION = "0"
+_UNSET = object()
 
 
 class HaloClient:
@@ -183,10 +194,49 @@ class HaloClient:
     def collars(self) -> list[dict[str, Any]]:
         """List collars owned by the authenticated account."""
 
-        value = self._request_json("GET", "/collar/my/")
+        value = self._request_json("GET", "/collar/my")
         if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
             raise HaloAPIError("Halo returned an unexpected collar list.")
         return value
+
+    def collar(self, collar_id: str) -> dict[str, Any]:
+        """Fetch one account collar, including its current ``petInfo`` relationship."""
+
+        return self._get_object(f"/collar/{_identifier(collar_id)}")
+
+    def firmware_statuses(self) -> list[dict[str, Any]]:
+        """Read installed and pending firmware state for every account collar.
+
+        Firmware rollout is server-managed. This method is a focused projection
+        of :meth:`collars`; it does not initiate, cancel, or select an update.
+        """
+
+        return [_firmware_status(collar) for collar in self.collars()]
+
+    def firmware_status(self, collar_id: str) -> dict[str, Any]:
+        """Read installed and pending firmware state for one account collar."""
+
+        return _firmware_status(self.collar(collar_id))
+
+    @staticmethod
+    def firmware_update_state(
+        status: dict[str, Any],
+    ) -> FirmwareUpdateStatus | str | None:
+        """Return a known firmware state enum while preserving future wire values."""
+
+        value = status.get("updateStatus")
+        if value is None:
+            update = status.get("firmwareUpdate")
+            if isinstance(update, dict):
+                update_details = update.get("update")
+                if isinstance(update_details, dict):
+                    value = update_details.get("status")
+        if not isinstance(value, str):
+            return None
+        try:
+            return FirmwareUpdateStatus.parse(value)
+        except ValueError:
+            return value
 
     def check_collar_binding(self, serial_number: str) -> dict[str, Any]:
         """Check whether a collar can be bound to the authenticated account.
@@ -211,8 +261,8 @@ class HaloClient:
         the printed serial number or the ``uuId`` in an account response is not
         known to be a substitute.
 
-        This route and request shape have been observed, but a successful live
-        response has not yet been independently verified.
+        This route and request shape have not yet been independently verified
+        against a successful live response.
         """
 
         return self._put_object(
@@ -226,11 +276,26 @@ class HaloClient:
             },
         )
 
+    def unbind_collar_from_user(self, collar_id: str) -> None:
+        """Remove a collar from the authenticated account.
+
+        This is not the same operation as detaching the collar from a pet. Halo's
+        client calls account removal directly even for an assigned collar, but
+        whether the server clears that pet relationship as a cascade has not been
+        independently observed. Call :meth:`unbind_collar_from_pet` first when a
+        deliberate two-stage removal is preferable.
+        """
+
+        self._request(
+            "POST",
+            f"/collar/{_identifier(collar_id)}/unbind-from-user",
+        )
+
     def pet(self, pet_id: str, *, refresh_telemetry: bool = False) -> dict[str, Any]:
         """Fetch a pet, optionally asking the collar for fresher telemetry."""
 
         return self._get_object(
-            f"/pet/{_identifier(pet_id)}/",
+            f"/pet/{_identifier(pet_id)}",
             params={"RefreshTelemetry": str(refresh_telemetry)},
         )
 
@@ -241,6 +306,47 @@ class HaloClient:
         if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
             raise HaloAPIError("Halo returned an unexpected pet list.")
         return value
+
+    def bind_collar_to_pet(self, pet_id: str, collar_id: str) -> None:
+        """Attach an account-bound collar to a pet.
+
+        ``collar_id`` is Halo's server-issued collar UUID, not its printed serial
+        number or Bluetooth-derived encrypted serial number. A successful HTTP
+        response acknowledges the request; use a refreshed :meth:`pet` read and
+        :meth:`pet_collar_binding_is_synchronized` to confirm that it was applied.
+        """
+
+        self._request(
+            "PUT",
+            f"/pet/{_identifier(pet_id)}/bind-collar",
+            json_body={"CollarId": _identifier(collar_id)},
+        )
+
+    def unbind_collar_from_pet(self, pet_id: str) -> None:
+        """Detach a collar from a pet while keeping it on the account."""
+
+        self._request("PUT", f"/pet/{_identifier(pet_id)}/unbind-collar")
+
+    @staticmethod
+    def pet_collar_binding_is_synchronized(
+        pet: dict[str, Any],
+        collar_id: str,
+    ) -> bool:
+        """Test a pet snapshot for a fully synchronized collar attachment."""
+
+        collar_info = pet.get("collarInfo")
+        return (
+            isinstance(collar_info, dict)
+            and str(collar_info.get("id")) == _identifier(collar_id)
+            and pet.get("isCollarBindingToPetSynchronized") is True
+        )
+
+    @staticmethod
+    def collar_is_assigned_to_pet(collar: dict[str, Any], pet_id: str) -> bool:
+        """Test a collar snapshot for the reciprocal current pet relationship."""
+
+        pet_info = collar.get("petInfo")
+        return isinstance(pet_info, dict) and str(pet_info.get("id")) == _identifier(pet_id)
 
     def set_pet_fences_enabled(
         self,
@@ -306,7 +412,8 @@ class HaloClient:
         ``geoFencesInfo``, and ``corrections``, so prefer this over several
         separate calls when polling. The apps always send a viewport centre, but
         Halo returns the whole account without one, so callers that only want
-        fences or pets may omit the coordinates.
+        fences or pets may omit the coordinates. A pet's ``currentGeoFenceId``
+        is collar-reported state, not a selection or assignment field.
         """
 
         if (latitude is None) != (longitude is None):
@@ -363,7 +470,13 @@ class HaloClient:
         return mobile_id
 
     def geofences(self) -> list[dict[str, Any]]:
-        """List the account's geofences, which Halo returns only on the map payload."""
+        """List the account's geofences, which Halo returns only on the map payload.
+
+        Fences are account-scoped and automatically distributed to the
+        account's pets. Each fence retains its ``petsSync`` entries describing
+        the result for every pet independently of the telemetry-derived
+        ``currentGeoFenceId``.
+        """
 
         info = self.account_map().get("geoFencesInfo")
         if not isinstance(info, dict):
@@ -373,14 +486,175 @@ class HaloClient:
             raise HaloAPIError("Halo returned an unexpected geofence list.")
         return value
 
+    def geo_fence_pet_sync(self, geo_fence_id: str) -> list[dict[str, Any]]:
+        """Return automatic per-pet distribution state for one account fence.
+
+        ``completed`` means the fence reached a collared pet; ``pending`` means
+        synchronization is still in progress. Collarless pets normally report
+        ``skipped``, which does not mean the account fence was unassigned.
+        """
+
+        identifier = _identifier(geo_fence_id)
+        for fence in self.geofences():
+            if str(fence.get("id")) != identifier:
+                continue
+            value = fence.get("petsSync")
+            if not isinstance(value, list) or not all(
+                isinstance(item, dict) for item in value
+            ):
+                raise HaloAPIError("Halo returned an unexpected fence pet-sync list.")
+            return value
+        raise HaloAPIError(f"Halo did not return fence {identifier}.")
+
     def walks(self, *, page: int = 1, page_size: int = 30) -> dict[str, Any]:
-        """Fetch one page of recorded walks."""
+        """Fetch one page of completed walks."""
 
         return self._get_object(
             "/walk/my",
             params={
                 "page": str(_positive(page, "page")),
                 "pageSize": str(_positive(page_size, "page_size")),
+            },
+        )
+
+    def walk_summary(self, walk_id: str) -> dict[str, Any]:
+        """Fetch one completed walk, including trail-image URLs when available."""
+
+        return self._get_object(f"/walk/{_identifier(walk_id)}/summary")
+
+    def set_walk_paused(
+        self,
+        walk_id: str,
+        collar_id: str,
+        paused: bool,
+    ) -> dict[str, Any]:
+        """Ask one collar to pause or resume an existing walk.
+
+        A ``result`` of ``success`` acknowledges the command; fresh collar
+        telemetry for the same walk id is the applied-state confirmation.
+        """
+
+        return self._post_object(
+            f"/walk/{_identifier(walk_id)}/set-is-paused",
+            json_body={
+                "CollarId": _identifier(collar_id),
+                "SetWalkIsPaused": _required_boolean(paused, "paused"),
+            },
+        )
+
+    def stop_walk(
+        self,
+        walk_id: str,
+        collar_id: str,
+        *,
+        stop_option: WalkStopOption | str = WalkStopOption.DEFAULT,
+    ) -> dict[str, Any]:
+        """Ask one collar to stop participating in a walk.
+
+        Stopping one collar does not finalize a multi-pet walk. A successful
+        command is confirmed when fresh telemetry reports ``walk`` as null.
+        """
+
+        return self._post_object(
+            f"/walk/{_identifier(walk_id)}/stop",
+            json_body={
+                "CollarId": _identifier(collar_id),
+                "StopOption": WalkStopOption.parse(stop_option).value,
+            },
+        )
+
+    def mark_walk_ended(
+        self,
+        walk_id: str,
+        *,
+        started_at: datetime | str,
+        ended_at: datetime | str,
+        pets: Sequence[dict[str, Any]],
+        user: dict[str, Any],
+        location_name: str | None,
+    ) -> None:
+        """Submit the aggregate summary for a completed walk.
+
+        ``pets`` and ``user`` use Halo's PascalCase summary DTO fields. This
+        request does not carry raw trail points; upload the rendered images
+        separately. Halo declares no response object, so any successful empty
+        2xx response is accepted.
+        """
+
+        pet_summaries = list(pets)
+        if not pet_summaries or not all(isinstance(item, dict) for item in pet_summaries):
+            raise ValueError("pets must contain at least one summary object.")
+        if not isinstance(user, dict):
+            raise ValueError("user must be a summary object.")
+        if location_name is not None:
+            _required(location_name, "location_name")
+        self._request(
+            "POST",
+            f"/walk/{_identifier(walk_id)}/mark-ended",
+            json_body={
+                "StartedAt": _walk_timestamp(started_at, "started_at"),
+                "EndedAt": _walk_timestamp(ended_at, "ended_at"),
+                "Pets": [item.copy() for item in pet_summaries],
+                "User": user.copy(),
+                "LocationName": location_name,
+            },
+        )
+
+    def upload_walk_trail_thumbnail(
+        self,
+        walk_id: str,
+        image: bytes,
+        *,
+        filename: str = "trail-thumbnail.png",
+        content_type: str = "image/png",
+    ) -> None:
+        """Upload the rendered overall trail thumbnail for a completed walk."""
+
+        self._upload_walk_image(
+            f"/walk/{_identifier(walk_id)}/trail-thumbnail",
+            field_name="trail-thumbnail",
+            image=image,
+            filename=filename,
+            content_type=content_type,
+        )
+
+    def upload_walk_pet_trail_image(
+        self,
+        walk_id: str,
+        pet_id: str,
+        image: bytes,
+        *,
+        filename: str = "trail-image.png",
+        content_type: str = "image/png",
+    ) -> None:
+        """Upload one pet's rendered trail image for a completed walk."""
+
+        self._upload_walk_image(
+            f"/walk/{_identifier(walk_id)}/pet/{_identifier(pet_id)}/trail-image",
+            field_name="trail-image",
+            image=image,
+            filename=filename,
+            content_type=content_type,
+        )
+
+    def _upload_walk_image(
+        self,
+        path: str,
+        *,
+        field_name: str,
+        image: bytes,
+        filename: str,
+        content_type: str,
+    ) -> None:
+        self._request(
+            "PUT",
+            path,
+            files={
+                field_name: (
+                    _required(filename, "filename"),
+                    _required_bytes(image, "image"),
+                    _required(content_type, "content_type"),
+                )
             },
         )
 
@@ -422,6 +696,29 @@ class HaloClient:
         """Fetch the configured correction rules for one pet."""
 
         return self._get_object(f"/pet/{_identifier(pet_id)}/correction-rules")
+
+    def update_correction_rules(
+        self,
+        items: Sequence[CorrectionRuleUpdate],
+    ) -> dict[str, Any]:
+        """Update only the identified persistent correction rules.
+
+        Each rule ID already identifies its pet and escalation slot. Omitted
+        rules are left alone; this is an item-level batch update despite the
+        route using ``PUT``. Read the valid levels and asset IDs from
+        :meth:`correction_rule_configuration` rather than hard-coding them.
+        """
+
+        if not items:
+            raise ValueError("Pass at least one correction rule to update.")
+        body_items = [_correction_rule_update_body(item) for item in items]
+        rule_ids = [item["CorrectionRuleId"] for item in body_items]
+        if len(rule_ids) != len(set(rule_ids)):
+            raise ValueError("Each correction rule may appear only once in an update.")
+        return self._put_object(
+            "/correction-rule",
+            json_body={"Items": body_items},
+        )
 
     def training(self) -> dict[str, Any]:
         """Fetch training course progress for the account."""
@@ -553,7 +850,8 @@ class HaloClient:
         Halo treats this as a full replacement rather than a patch, so every
         field is required; read :meth:`pet` first and pass back the values you
         are not changing. Saving marks the collar's configuration ``outdated``
-        until it next syncs.
+        until it next syncs. ``currentGeoFenceId`` may appear in Halo's response
+        but is reported state and is deliberately not sent in this request.
         """
 
         return self._put_object(
@@ -578,7 +876,8 @@ class HaloClient:
     ) -> list[Any]:
         """Preview the safe zone Halo derives from a drawn boundary.
 
-        The app calls this while the user drags fence points, before saving.
+        The submitted points describe the warning boundary; Halo returns the
+        generated safe-zone geometry. This is a preview and changes no fence.
         """
 
         value = self._request_json(
@@ -622,7 +921,9 @@ class HaloClient:
         """Create a containment fence.
 
         This changes where the collar will correct the dog. Verify the boundary
-        before saving; the app calls :meth:`geo_fence_safe_zones` first.
+        before saving by calling :meth:`geo_fence_safe_zones` first. The
+        response's ``geoFence.petsSync`` entries report which pets Halo assigned
+        automatically and whether each collar has synchronized.
         """
 
         return self._post_object(
@@ -636,7 +937,10 @@ class HaloClient:
         )
 
     def rename_geo_fence(self, geo_fence_id: str, name: str) -> None:
-        """Rename a fence without touching its boundary."""
+        """Rename a fence without touching its boundary.
+
+        Halo answers HTTP 200 with an empty body.
+        """
 
         self._request(
             "PUT",
@@ -654,7 +958,8 @@ class HaloClient:
         """Move a fence's boundary.
 
         The new boundary replaces the old one outright and takes effect once the
-        collar syncs, so a mistake here can leave a dog uncontained.
+        collar syncs, so a mistake here can leave a dog uncontained. Halo
+        normally answers ``{"status": "success"}`` without returning geometry.
         """
 
         return self._put_object(
@@ -705,10 +1010,192 @@ class HaloClient:
         return self._get_object("/user-profile/")
 
     def beacons(self) -> dict[str, Any] | list[Any]:
-        value = self._request_json("GET", "/beacon/my/")
+        """Return account beacons and the server's available range configuration."""
+
+        value = self._request_json("GET", "/beacon/my")
         if not isinstance(value, (dict, list)):
             raise HaloAPIError("Halo returned an unexpected beacon response.")
         return value
+
+    def beacon_name_is_available(
+        self,
+        name: str,
+        *,
+        beacon_id: str | None = None,
+    ) -> bool:
+        """Check a new or existing beacon name for a server-side conflict."""
+
+        return self._name_is_available(
+            "/beacon/check-name-uniqueness",
+            name,
+            beacon_id,
+        )
+
+    def check_beacon_binding(self, serial_number: str) -> dict[str, Any]:
+        """Check whether a physical beacon serial can be bound to this account."""
+
+        return self._put_object(
+            "/beacon/check-can-be-bound-to-user",
+            json_body={"SerialNumber": _required(serial_number, "serial_number")},
+        )
+
+    def add_beacon(
+        self,
+        *,
+        name: str,
+        serial_number: str,
+        model_type: BeaconModelType | str,
+        action_type: BeaconActionType | str,
+        should_notify: bool,
+        beacon_range: dict[str, Any] | None = None,
+        is_enabled: bool | None = None,
+        transmission_rate_milliseconds: int | None = None,
+        correction_escalation_type: BeaconCorrectionEscalationType | str | None = None,
+        pet_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Add or bind a physical beacon and return its complete server object."""
+
+        return self._post_object(
+            "/beacon",
+            json_body={
+                "Name": _required(name, "name"),
+                "SerialNumber": _required(serial_number, "serial_number"),
+                "ModelType": BeaconModelType.parse(model_type).value,
+                "Range": _beacon_range(beacon_range),
+                "IsEnabled": _nullable_boolean(is_enabled, "is_enabled"),
+                "ActionType": BeaconActionType.parse(action_type).value,
+                "ShouldNotify": _required_boolean(should_notify, "should_notify"),
+                "TransmissionRateMilliseconds": _nullable_positive_integer(
+                    transmission_rate_milliseconds,
+                    "transmission_rate_milliseconds",
+                ),
+                "CorrectionEscalationType": (
+                    BeaconCorrectionEscalationType.parse(
+                        correction_escalation_type
+                    ).value
+                    if correction_escalation_type is not None
+                    else None
+                ),
+                "PetId": _nullable_identifier(pet_id, "pet_id"),
+            },
+        )
+
+    def update_beacon(
+        self,
+        beacon_id: str,
+        *,
+        name: Any = _UNSET,
+        is_enabled: Any = _UNSET,
+        action_type: Any = _UNSET,
+        should_notify: Any = _UNSET,
+        beacon_range: Any = _UNSET,
+        model_type: Any = _UNSET,
+        transmission_rate_milliseconds: Any = _UNSET,
+        correction_escalation_type: Any = _UNSET,
+        pet_id: Any = _UNSET,
+    ) -> dict[str, Any]:
+        """Update only the supplied beacon settings.
+
+        Every server field is nullable. Omitting a keyword leaves it out of the
+        request, while explicitly passing ``None`` sends JSON null.
+        """
+
+        body: dict[str, Any] = {}
+        if name is not _UNSET:
+            body["Name"] = _nullable_required(name, "name")
+        if is_enabled is not _UNSET:
+            body["IsEnabled"] = _nullable_boolean(is_enabled, "is_enabled")
+        if action_type is not _UNSET:
+            body["ActionType"] = (
+                BeaconActionType.parse(action_type).value
+                if action_type is not None
+                else None
+            )
+        if should_notify is not _UNSET:
+            body["ShouldNotify"] = _nullable_boolean(should_notify, "should_notify")
+        if beacon_range is not _UNSET:
+            body["Range"] = _beacon_range(beacon_range)
+        if model_type is not _UNSET:
+            body["ModelType"] = (
+                BeaconModelType.parse(model_type).value if model_type is not None else None
+            )
+        if transmission_rate_milliseconds is not _UNSET:
+            body["TransmissionRateMilliseconds"] = _nullable_positive_integer(
+                transmission_rate_milliseconds,
+                "transmission_rate_milliseconds",
+            )
+        if correction_escalation_type is not _UNSET:
+            body["CorrectionEscalationType"] = (
+                BeaconCorrectionEscalationType.parse(
+                    correction_escalation_type
+                ).value
+                if correction_escalation_type is not None
+                else None
+            )
+        if pet_id is not _UNSET:
+            body["PetId"] = _nullable_identifier(pet_id, "pet_id")
+        if not body:
+            raise ValueError("Pass at least one beacon field to update.")
+        return self._put_object(
+            f"/beacon/{_identifier(beacon_id)}",
+            json_body=body,
+        )
+
+    def delete_beacon(self, beacon_id: str) -> None:
+        """Delete or unbind one beacon server record."""
+
+        self._request("DELETE", f"/beacon/{_identifier(beacon_id)}")
+
+    def upload_beacon_telemetry(
+        self,
+        readings: Sequence[dict[str, Any]],
+    ) -> None:
+        """Upload battery observations discovered locally by the phone."""
+
+        normalized = []
+        for reading in readings:
+            if not isinstance(reading, dict):
+                raise ValueError("Beacon telemetry readings must be objects.")
+            normalized.append(
+                {
+                    "SerialNumber": _required(
+                        reading.get("SerialNumber"),
+                        "SerialNumber",
+                    ),
+                    "BatteryChargePercent": _percentage(
+                        reading.get("BatteryChargePercent"),
+                        "BatteryChargePercent",
+                    ),
+                }
+            )
+        if not normalized:
+            raise ValueError("At least one beacon telemetry reading is required.")
+        self._request(
+            "PUT",
+            "/beacon/telemetry",
+            json_body={"BeaconsTelemetry": normalized},
+        )
+
+    def beacon_pet_sync(self, beacon_id: str) -> list[dict[str, Any]]:
+        """Return per-pet distribution state for one account beacon."""
+
+        identifier = _identifier(beacon_id)
+        payload = self.beacons()
+        if not isinstance(payload, dict):
+            raise HaloAPIError("Halo returned an unexpected beacon collection.")
+        beacons = payload.get("beacons")
+        if not isinstance(beacons, list):
+            raise HaloAPIError("Halo returned an unexpected beacon list.")
+        for beacon in beacons:
+            if not isinstance(beacon, dict) or str(beacon.get("id")) != identifier:
+                continue
+            value = beacon.get("petsSync")
+            if not isinstance(value, list) or not all(
+                isinstance(item, dict) for item in value
+            ):
+                raise HaloAPIError("Halo returned an unexpected beacon pet-sync list.")
+            return value
+        raise HaloAPIError(f"Halo did not return beacon {identifier}.")
 
     def subscription(self) -> dict[str, Any] | list[Any]:
         value = self._request_json("GET", "/subscription/my/")
@@ -756,6 +1243,135 @@ class HaloClient:
             ):
                 return True
         return False
+
+    def test_correction_on_collar(
+        self,
+        pet_id: str,
+        kind_type: CorrectionRuleKindType | str,
+        *,
+        sound_id: str | None = None,
+        vibration_id: str | None = None,
+        sound_intensity_level: int | None = None,
+        shock_intensity_level: int | None = None,
+        command_number: int | None = None,
+        expiration_seconds: int = 30,
+        require_online: bool = True,
+    ) -> dict[str, Any]:
+        """Test proposed feedback directly on a pet's collar exactly once.
+
+        This does not save a persistent correction rule. The command counter is
+        reserved before dispatch and transport failures are never retried because
+        the collar may already have acted. The 30-second expiry is a conservative
+        client default and callers may override it explicitly.
+        """
+
+        pet_identifier = _identifier(pet_id)
+        kind = CorrectionRuleKindType.parse(kind_type)
+        expires_in = _positive(expiration_seconds, "expiration_seconds")
+        sound = _nullable_identifier(sound_id, "sound_id")
+        vibration = _nullable_identifier(vibration_id, "vibration_id")
+        sound_level = _nullable_positive_integer(
+            sound_intensity_level,
+            "sound_intensity_level",
+        )
+        shock_level = _nullable_positive_integer(
+            shock_intensity_level,
+            "shock_intensity_level",
+        )
+        if kind is CorrectionRuleKindType.SOUND:
+            _validate_correction_modality(
+                kind,
+                level=sound_level,
+                sound_id=sound,
+                vibration_id=vibration,
+            )
+            if shock_level is not None:
+                raise ValueError("Sound collar tests cannot include shock_intensity_level.")
+        elif kind is CorrectionRuleKindType.VIBRATION:
+            _validate_correction_modality(
+                kind,
+                level=sound_level,
+                sound_id=sound,
+                vibration_id=vibration,
+            )
+            if shock_level is not None:
+                raise ValueError("Vibration collar tests cannot include shock_intensity_level.")
+        else:
+            _validate_correction_modality(
+                kind,
+                level=shock_level,
+                sound_id=sound,
+                vibration_id=vibration,
+            )
+            if sound_level is not None:
+                raise ValueError("Shock collar tests cannot include sound_intensity_level.")
+
+        if require_online:
+            collar = self.collar_for_pet(pet_identifier)
+            if not self.collar_is_online(collar):
+                raise UnsafeCorrectionError(
+                    "Halo does not report this collar as socket-connected over Wi-Fi or cellular."
+                )
+        server_now = self.server_time()
+        reserved_number = self.store.reserve_command_number(
+            pet_identifier,
+            command_number,
+        )
+        expiration = server_now + timedelta(seconds=expires_in)
+        body = {
+            "MobileId": self.mobile_id,
+            "CommandNumber": reserved_number,
+            "PetId": pet_identifier,
+            "KindType": kind.value,
+            "SoundId": sound,
+            "VibrationId": vibration,
+            "SoundIntensityLevel": sound_level,
+            "ShockIntensityLevel": shock_level,
+            "ExpirationDate": _format_utc(expiration),
+        }
+        try:
+            response = self._request(
+                "PUT",
+                "/correction-rule/test-on-collar",
+                json_body=body,
+                wrap_transport_errors=False,
+                raise_for_status=False,
+            )
+        except httpx.HTTPError as exc:
+            raise CorrectionOutcomeUnknownError(
+                "The collar-test request encountered a network error after dispatch. "
+                "It was not retried; its delivery is unknown."
+            ) from exc
+
+        value = self._decode_json(response)
+        if not isinstance(value, dict):
+            raise HaloAPIError(
+                "Halo returned an unexpected collar-test response.",
+                status_code=response.status_code,
+                method="PUT",
+                path="/correction-rule/test-on-collar",
+            )
+        if str(value.get("result", "")).casefold() == "oldcommandnumber":
+            current = value.get("currentCommandNumber")
+            current_number = current if isinstance(current, int) else None
+            if current_number is not None:
+                self.store.reconcile_command_number(pet_identifier, current_number)
+            raise StaleCommandNumberError(current_number, value)
+        if response.is_error:
+            raise HaloAPIError(
+                f"Halo API collar-test request failed with HTTP {response.status_code}.",
+                status_code=response.status_code,
+                method="PUT",
+                path="/correction-rule/test-on-collar",
+            )
+        if str(value.get("result", "")).casefold() != "success":
+            raise HaloAPIError(
+                f"Halo did not accept the collar test (result={value.get('result', 'unknown')!r}).",
+                status_code=response.status_code,
+                method="PUT",
+                path="/correction-rule/test-on-collar",
+            )
+        return value
 
     def send_instant_correction(
         self,
@@ -906,6 +1522,7 @@ class HaloClient:
         *,
         params: dict[str, str] | None = None,
         json_body: dict[str, Any] | None = None,
+        files: dict[str, tuple[str, bytes, str]] | None = None,
         authenticated: bool = True,
         retry_after_unauthorized: bool = True,
         wrap_transport_errors: bool = True,
@@ -931,6 +1548,7 @@ class HaloClient:
                 f"{self.api_base_url}{path}",
                 params=params,
                 json=json_body,
+                files=files,
                 headers=headers,
             )
         except httpx.HTTPError as exc:
@@ -952,6 +1570,7 @@ class HaloClient:
                 path,
                 params=params,
                 json_body=json_body,
+                files=files,
                 authenticated=authenticated,
                 retry_after_unauthorized=False,
                 wrap_transport_errors=wrap_transport_errors,
@@ -1004,6 +1623,23 @@ def _video_assets(configuration: Any) -> list[dict[str, Any]]:
     return found
 
 
+def _firmware_status(collar: dict[str, Any]) -> dict[str, Any]:
+    update = collar.get("firmwareUpdate")
+    update_details = update.get("update") if isinstance(update, dict) else None
+    update_status = (
+        update_details.get("status") if isinstance(update_details, dict) else None
+    )
+    return {
+        "collarId": collar.get("id"),
+        "serialNumber": collar.get("serialNumber"),
+        "collarType": collar.get("type"),
+        "firmware": collar.get("firmware"),
+        "hasFirmwareUpdatesAvailable": collar.get("hasFirmwareUpdatesAvailable"),
+        "firmwareUpdate": update,
+        "updateStatus": update_status,
+    }
+
+
 def _identifier(value: str) -> str:
     """Allow UUIDs/serial-like IDs while blocking accidental path injection."""
 
@@ -1023,6 +1659,119 @@ def _required_boolean(value: bool, name: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{name} must be a boolean.")
     return value
+
+
+def _nullable_required(value: Any, name: str) -> str | None:
+    if value is None:
+        return None
+    return _required(value, name)
+
+
+def _nullable_boolean(value: Any, name: str) -> bool | None:
+    if value is None:
+        return None
+    return _required_boolean(value, name)
+
+
+def _nullable_positive_integer(value: Any, name: str) -> int | None:
+    if value is None:
+        return None
+    return _positive(value, name)
+
+
+def _nullable_identifier(value: Any, name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a Halo identifier or None.")
+    return _identifier(value)
+
+
+def _correction_rule_update_body(item: CorrectionRuleUpdate) -> dict[str, Any]:
+    if not isinstance(item, CorrectionRuleUpdate):
+        raise ValueError("items must contain CorrectionRuleUpdate values.")
+    kind = CorrectionRuleKindType.parse(item.kind_type)
+    level = _nullable_positive_integer(item.level, "level")
+    sound_id = _nullable_identifier(item.sound_id, "sound_id")
+    vibration_id = _nullable_identifier(item.vibration_id, "vibration_id")
+    _validate_correction_modality(
+        kind,
+        level=level,
+        sound_id=sound_id,
+        vibration_id=vibration_id,
+    )
+    return {
+        "CorrectionRuleId": _identifier(item.correction_rule_id),
+        "KindType": kind.value,
+        "Level": level,
+        "SoundId": sound_id,
+        "VibrationId": vibration_id,
+    }
+
+
+def _validate_correction_modality(
+    kind: CorrectionRuleKindType,
+    *,
+    level: int | None,
+    sound_id: str | None,
+    vibration_id: str | None,
+) -> None:
+    if kind is CorrectionRuleKindType.SOUND:
+        if sound_id is None:
+            raise ValueError("Sound correction settings require sound_id.")
+        if vibration_id is not None:
+            raise ValueError("Sound correction settings cannot include vibration_id.")
+    elif kind is CorrectionRuleKindType.VIBRATION:
+        if vibration_id is None:
+            raise ValueError("Vibration correction settings require vibration_id.")
+        if sound_id is not None or level is not None:
+            raise ValueError("Vibration correction settings cannot include sound_id or level.")
+    else:
+        if level is None:
+            raise ValueError("Shock correction settings require level.")
+        if sound_id is not None or vibration_id is not None:
+            raise ValueError("Shock correction settings cannot include sound_id or vibration_id.")
+
+
+def _integer(value: Any, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer.")
+    return value
+
+
+def _percentage(value: Any, name: str) -> int:
+    result = _integer(value, name)
+    if not 0 <= result <= 100:
+        raise ValueError(f"{name} must be between 0 and 100.")
+    return result
+
+
+def _beacon_range(value: Any) -> dict[str, int] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("beacon_range must be an object or None.")
+    if "Level" not in value or "RadiusInDecibel" not in value:
+        raise ValueError("beacon_range requires Level and RadiusInDecibel.")
+    return {
+        "Level": _positive(value["Level"], "beacon_range.Level"),
+        "RadiusInDecibel": _integer(
+            value["RadiusInDecibel"],
+            "beacon_range.RadiusInDecibel",
+        ),
+    }
+
+
+def _required_bytes(value: bytes, name: str) -> bytes:
+    if not isinstance(value, bytes) or not value:
+        raise ValueError(f"{name} must be non-empty bytes.")
+    return value
+
+
+def _walk_timestamp(value: datetime | str, name: str) -> str:
+    if isinstance(value, datetime):
+        return _format_utc(value)
+    return _required(value, name)
 
 
 def _pet_body(
