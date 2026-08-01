@@ -25,7 +25,8 @@ Implemented functionality:
 - Pet listing (including collarless pets), details, creation, editing, and
   optional telemetry refresh, plus containment and beacon mode changes
 - The aggregate map view, geofence create/rename/move/delete, and safe-zone preview
-- User profile, complete beacon management, subscription, and in-app notifications
+- Profile, avatar, onboarding, questionnaire, email-change, complete beacon management,
+  subscription, and in-app notifications
 - Walk history, remote pause/stop commands, completed-walk submission and images
 - Notification history and marking notifications read
 - Correction-rule reading/editing and the sound/vibration intensity catalog
@@ -391,6 +392,50 @@ beta/production-selection command. Capability strings such as `fota` and
 `firmwareupdatecancellation` describe the collar; they do not establish a
 customer-facing HTTP operation.
 
+## Manage the account profile
+
+The editable profile fields are deliberately separate from read-only profile
+state:
+
+```bash
+halo account update-name Taylor Quinn
+halo account avatar-upload avatar.jpg --content-type image/jpeg
+halo account avatar-delete
+```
+
+Onboarding and questionnaire writes take complete PascalCase DTO files:
+
+```bash
+halo account onboarding
+halo account onboarding-update onboarding.json
+halo account questionnaire
+halo account questionnaire-save questionnaire.json
+```
+
+An onboarding file contains `Version`, `Steps`, and `ProgressState`. Halo
+rejects stale versions, so reload `halo account onboarding` before retrying a
+conflict. A questionnaire file normally contains `HaveTrainedDogsBefore` and
+`PrimaryGoalChoices`. Saving it indirectly sets `hasCompletedQuestionnaire`; a
+successful questionnaire read is the reliable completion check.
+`hasFinishedUserGuide` remains read-only because no supported setter exists.
+
+Email changes use the normal authenticated session and the code delivered to the
+new address—these calls do not send a password or step-up credential:
+
+```bash
+halo account email-check new@example.com
+halo account email-request new@example.com
+halo account email-confirm 123456
+halo account email-resend
+halo account email-cancel
+```
+
+Confirm a completed change with `halo account profile --full`: the profile email
+or current email should change and `hasChangeEmailRequest` should be false. The
+email request, confirmation, cancellation, avatar deletion, and account
+deletion commands require explicit confirmation. `halo account delete`
+permanently deletes the authenticated account.
+
 ## Pet containment and beacon modes
 
 Containment fences and beacon assignment use separate operations:
@@ -480,7 +525,20 @@ Supported upstream routes:
 | PUT | `/pet/{id}/unbind-collar` | `unbind_collar_from_pet()` |
 | GET | `/account/my/map` | `account_map()`, `geofences()`, `geo_fence_pet_sync()` |
 | POST | `/account/mobile-data` | `register_mobile_device()` |
-| GET | `/user-profile/` | `user_profile()` |
+| GET | `/user-profile` | `user_profile()` |
+| PUT | `/user-profile` | `update_profile_name()` |
+| PUT | `/user-profile/me/icon` | `upload_profile_avatar()` |
+| DELETE | `/user-profile/me/icon` | `delete_profile_avatar()` |
+| GET | `/user-profile/onboarding/progress` | `onboarding_progress()` |
+| PUT | `/user-profile/onboarding/progress` | `update_onboarding_progress()` |
+| GET | `/user-profile/questionnaire` | `questionnaire()` |
+| PUT | `/user-profile/questionnaire` | `save_questionnaire()` |
+| POST | `/account/check-user-can-change-email` | `check_user_can_change_email()` |
+| POST | `/account/email-change-request` | `request_email_change()` |
+| POST | `/account/email-change-request/confirm` | `confirm_email_change()` |
+| POST | `/account/email-change-request/resend-email` | `resend_email_change_confirmation()` |
+| PUT | `/account/email-change-request` | `cancel_email_change()` |
+| DELETE | `/account` | `delete_account()` |
 | GET | `/beacon/my` | `beacons()`, `beacon_pet_sync()` |
 | PUT | `/beacon/check-name-uniqueness` | `beacon_name_is_available()` |
 | POST | `/beacon` | `add_beacon()` |
@@ -929,8 +987,6 @@ not implemented:
   `cellularExtendedSettings`.
 - **Calibration.** The firmware advertises `gpscalibration`,
   `compasscalibration`, and `manualgpscalibration`.
-- **Account/profile edits** implied by `hasChangeEmailRequest`,
-  `hasCompletedQuestionnaire`, and `hasFinishedUserGuide`.
 
 ### Beyond REST
 

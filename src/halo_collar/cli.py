@@ -473,7 +473,7 @@ def _build_account(subparsers: Any) -> None:
         subparsers,
         "account",
         help_text="Profile, subscription, and the combined map view.",
-        description="Read account-level data.",
+        description="Read and manage account-level profile data.",
     )
     _with_full(
         _leaf(
@@ -526,6 +526,151 @@ def _build_account(subparsers: Any) -> None:
         type=int,
         default=20,
         help="How many recent corrections to include (default: 20).",
+    )
+
+    update_name = _leaf(
+        account,
+        "update-name",
+        help_text="Update the profile's first and last name.",
+        description="Replace the two editable name fields; this is not a generic profile patch.",
+        examples="  halo account update-name Taylor Quinn",
+        handler=_account_update_name,
+    )
+    update_name.add_argument("first_name", help="New first name.")
+    update_name.add_argument("last_name", help="New last name.")
+
+    avatar_upload = _leaf(
+        account,
+        "avatar-upload",
+        help_text="Upload a profile avatar image.",
+        description="Upload an image through Halo's profile icon multipart field.",
+        examples="  halo account avatar-upload avatar.jpg --content-type image/jpeg",
+        handler=_account_avatar_upload,
+    )
+    avatar_upload.add_argument("image_file", help="Path to the avatar image.")
+    avatar_upload.add_argument(
+        "--content-type",
+        default="image/png",
+        help="Image MIME type (default: image/png).",
+    )
+
+    _with_confirmation(
+        _leaf(
+            account,
+            "avatar-delete",
+            help_text="Remove the profile avatar.",
+            description="Remove the current avatar image from the account profile.",
+            examples="  halo account avatar-delete\n  halo account avatar-delete --yes",
+            handler=_account_avatar_delete,
+        )
+    )
+
+    _leaf(
+        account,
+        "onboarding",
+        help_text="Show versioned onboarding progress.",
+        description="Show the versioned onboarding progress DTO returned by Halo.",
+        examples="  halo account onboarding",
+        handler=_account_onboarding,
+    )
+    onboarding_update = _leaf(
+        account,
+        "onboarding-update",
+        help_text="Save versioned onboarding progress from JSON.",
+        description=(
+            "Save a PascalCase OnboardingProgressDto file; stale versions must be reloaded."
+        ),
+        examples="  halo account onboarding-update onboarding.json",
+        handler=_account_onboarding_update,
+    )
+    onboarding_update.add_argument(
+        "progress_file",
+        help="Path to an OnboardingProgressDto JSON file.",
+    )
+
+    _leaf(
+        account,
+        "questionnaire",
+        help_text="Show the saved account questionnaire.",
+        description="A successful read is Halo's effective questionnaire completion check.",
+        examples="  halo account questionnaire",
+        handler=_account_questionnaire,
+    )
+    questionnaire_save = _leaf(
+        account,
+        "questionnaire-save",
+        help_text="Save a questionnaire DTO from JSON.",
+        description="Save a complete PascalCase UserQuestionnaireDto file.",
+        examples="  halo account questionnaire-save questionnaire.json",
+        handler=_account_questionnaire_save,
+    )
+    questionnaire_save.add_argument(
+        "questionnaire_file",
+        help="Path to a UserQuestionnaireDto JSON file.",
+    )
+
+    _leaf(
+        account,
+        "email-check",
+        help_text="Check whether an email can be changed to.",
+        description="Check target-email eligibility without starting a change.",
+        examples="  halo account email-check new@example.com",
+        handler=_account_email_check,
+    ).add_argument("email", help="Proposed new email address.")
+
+    email_request = _with_confirmation(
+        _leaf(
+            account,
+            "email-request",
+            help_text="Start an email-change request.",
+            description="Send a confirmation code to a new email address.",
+            examples="  halo account email-request new@example.com --yes",
+            handler=_account_email_request,
+        )
+    )
+    email_request.add_argument("email", help="New email address that will receive the code.")
+
+    email_confirm = _with_confirmation(
+        _leaf(
+            account,
+            "email-confirm",
+            help_text="Confirm a pending email change.",
+            description="Complete the pending email change with the emailed code.",
+            examples="  halo account email-confirm 123456 --yes",
+            handler=_account_email_confirm,
+        )
+    )
+    email_confirm.add_argument("code", help="Confirmation code received at the new address.")
+
+    _leaf(
+        account,
+        "email-resend",
+        help_text="Resend a pending email-change confirmation code.",
+        description="Resend the confirmation email for the pending email change.",
+        examples="  halo account email-resend",
+        handler=_account_email_resend,
+    )
+
+    _with_confirmation(
+        _leaf(
+            account,
+            "email-cancel",
+            help_text="Cancel or restore a pending email change.",
+            description="Cancel or restore the account's pending email-change request.",
+            examples="  halo account email-cancel --yes",
+            handler=_account_email_cancel,
+        )
+    )
+
+    _with_confirmation(
+        _leaf(
+            account,
+            "delete",
+            help_text="Permanently delete the account (destructive).",
+            description="Permanently delete the authenticated Halo account.",
+            examples="  halo account delete --yes",
+            handler=_account_delete,
+        )
     )
 
 
@@ -1782,6 +1927,157 @@ def _account_map(args: argparse.Namespace, client: HaloClient, out: Output) -> i
     return EXIT_OK
 
 
+def _account_update_name(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    profile = client.update_profile_name(args.first_name, args.last_name)
+    out.note("Updated the profile name.")
+    if profile is not None:
+        out.emit(profile)
+    return EXIT_OK
+
+
+def _account_avatar_upload(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    path, image = _read_image(args.image_file, label="avatar image")
+    client.upload_profile_avatar(
+        image,
+        filename=path.name,
+        content_type=args.content_type,
+    )
+    out.note("Uploaded the profile avatar.")
+    return EXIT_OK
+
+
+def _account_avatar_delete(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    if not _confirmed(
+        args,
+        out,
+        warning="\nThis will remove the current profile avatar.",
+        prompt="Type DELETE to remove the avatar: ",
+        expected="DELETE",
+        cancelled="Cancelled; the profile avatar was not removed.",
+    ):
+        return EXIT_NO_LOGIN
+    client.delete_profile_avatar()
+    out.note("Removed the profile avatar.")
+    return EXIT_OK
+
+
+def _account_onboarding(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    out.emit(client.onboarding_progress())
+    return EXIT_OK
+
+
+def _account_onboarding_update(
+    args: argparse.Namespace,
+    client: HaloClient,
+    out: Output,
+) -> int:
+    progress = _read_json_object(args.progress_file, "onboarding progress")
+    required = ("Version", "Steps", "ProgressState")
+    missing = [key for key in required if key not in progress]
+    if missing:
+        raise ValueError(f"Onboarding progress is missing: {', '.join(missing)}.")
+    updated = client.update_onboarding_progress(
+        version=progress["Version"],
+        steps=progress["Steps"],
+        progress_state=progress["ProgressState"],
+    )
+    out.note("Saved onboarding progress. Reload it before retrying an out-of-date version.")
+    out.emit(updated)
+    return EXIT_OK
+
+
+def _account_questionnaire(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    out.emit(client.questionnaire())
+    return EXIT_OK
+
+
+def _account_questionnaire_save(
+    args: argparse.Namespace,
+    client: HaloClient,
+    out: Output,
+) -> int:
+    questionnaire = _read_json_object(args.questionnaire_file, "questionnaire")
+    saved = client.save_questionnaire(questionnaire)
+    out.note("Saved the questionnaire. A successful questionnaire read confirms completion.")
+    if saved is not None:
+        out.emit(saved)
+    return EXIT_OK
+
+
+def _account_email_check(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    client.check_user_can_change_email(args.email)
+    out.note(f"Halo accepted {args.email} as eligible for an email-change request.")
+    return EXIT_OK
+
+
+def _account_email_request(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    if not _confirmed(
+        args,
+        out,
+        warning=f"\nThis will send an email-change code to {args.email}.",
+        prompt=f"Type the new email ({args.email}) to request the change: ",
+        expected=args.email,
+        cancelled="Cancelled; no email-change request was started.",
+    ):
+        return EXIT_NO_LOGIN
+    client.request_email_change(args.email)
+    out.note("Requested the email change. Confirm it with the code sent to the new address.")
+    return EXIT_OK
+
+
+def _account_email_confirm(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    if not _confirmed(
+        args,
+        out,
+        warning="\nThis will confirm the pending account-email change.",
+        prompt="Type CONFIRM to complete the email change: ",
+        expected="CONFIRM",
+        cancelled="Cancelled; the email change was not confirmed.",
+    ):
+        return EXIT_NO_LOGIN
+    client.confirm_email_change(args.code)
+    out.note("Confirmed the email change. Run `halo account profile --full` to verify it.")
+    return EXIT_OK
+
+
+def _account_email_resend(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    client.resend_email_change_confirmation()
+    out.note("Resent the pending email-change confirmation message.")
+    return EXIT_OK
+
+
+def _account_email_cancel(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    if not _confirmed(
+        args,
+        out,
+        warning="\nThis will cancel or restore the pending account-email change.",
+        prompt="Type CANCEL to cancel the pending email change: ",
+        expected="CANCEL",
+        cancelled="Cancelled; the pending email change was left alone.",
+    ):
+        return EXIT_NO_LOGIN
+    out.emit(client.cancel_email_change())
+    return EXIT_OK
+
+
+def _account_delete(args: argparse.Namespace, client: HaloClient, out: Output) -> int:
+    profile = client.user_profile()
+    email = profile.get("currentEmail") or profile.get("email")
+    expected = str(email) if isinstance(email, str) and email else "DELETE"
+    if not _confirmed(
+        args,
+        out,
+        warning="\nThis permanently deletes the authenticated Halo account.",
+        prompt=f"Type {expected} to permanently delete the account: ",
+        expected=expected,
+        cancelled="Cancelled; the account was not deleted.",
+    ):
+        return EXIT_NO_LOGIN
+    client.delete_account()
+    out.note("Deleted the Halo account. Remove any remaining local credentials manually.")
+    return EXIT_OK
+
+
 PET_COLUMNS = [
     Column("NAME", "name"),
     Column("BREED", "breed"),
@@ -2469,14 +2765,14 @@ def _walk_mark_ended(args: argparse.Namespace, client: HaloClient, out: Output) 
     return EXIT_OK
 
 
-def _read_image(path_value: str) -> tuple[Path, bytes]:
+def _read_image(path_value: str, *, label: str = "image") -> tuple[Path, bytes]:
     path = Path(path_value)
     try:
         image = path.read_bytes()
     except OSError as exc:
-        raise ValueError(f"Cannot read walk image at {path}.") from exc
+        raise ValueError(f"Cannot read {label} at {path}.") from exc
     if not image:
-        raise ValueError(f"Walk image at {path} is empty.")
+        raise ValueError(f"{label.capitalize()} at {path} is empty.")
     return path, image
 
 

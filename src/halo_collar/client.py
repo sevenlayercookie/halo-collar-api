@@ -1007,7 +1007,137 @@ class HaloClient:
         )
 
     def user_profile(self) -> dict[str, Any]:
-        return self._get_object("/user-profile/")
+        """Fetch the authenticated account profile and completion flags."""
+
+        return self._get_object("/user-profile")
+
+    def update_profile_name(self, first_name: str, last_name: str) -> dict[str, Any] | None:
+        """Replace the only editable profile fields: first and last name."""
+
+        return self._put_optional_object(
+            "/user-profile",
+            json_body={
+                "FirstName": _required(first_name, "first_name"),
+                "LastName": _required(last_name, "last_name"),
+            },
+        )
+
+    def upload_profile_avatar(
+        self,
+        image: bytes,
+        *,
+        filename: str = "avatar.png",
+        content_type: str = "image/png",
+    ) -> None:
+        """Upload an account avatar through the ``icon`` multipart field."""
+
+        self._request(
+            "PUT",
+            "/user-profile/me/icon",
+            files={
+                "icon": (
+                    _required(filename, "filename"),
+                    _required_bytes(image, "image"),
+                    _required(content_type, "content_type"),
+                )
+            },
+        )
+
+    def delete_profile_avatar(self) -> None:
+        """Remove the current account avatar."""
+
+        self._request("DELETE", "/user-profile/me/icon")
+
+    def onboarding_progress(self) -> dict[str, Any]:
+        """Fetch Halo's versioned onboarding progress object."""
+
+        return self._get_object("/user-profile/onboarding/progress")
+
+    def update_onboarding_progress(
+        self,
+        *,
+        version: int,
+        steps: Sequence[str | dict[str, Any]],
+        progress_state: str,
+    ) -> dict[str, Any]:
+        """Save versioned onboarding progress and return its normalized response.
+
+        Halo rejects stale versions rather than merging them. Reload
+        :meth:`onboarding_progress` before retrying a conflict.
+        """
+
+        return self._put_object(
+            "/user-profile/onboarding/progress",
+            json_body={
+                "Version": _nonnegative_integer(version, "version"),
+                "Steps": _onboarding_steps(steps),
+                "ProgressState": _required(progress_state, "progress_state"),
+            },
+        )
+
+    def questionnaire(self) -> dict[str, Any]:
+        """Fetch the saved account questionnaire.
+
+        Halo represents an absent questionnaire as an API error, not an empty
+        object, so a successful read is the completion check.
+        """
+
+        return self._get_object("/user-profile/questionnaire")
+
+    def save_questionnaire(self, questionnaire: dict[str, Any]) -> dict[str, Any] | None:
+        """Save a complete PascalCase ``UserQuestionnaireDto`` object."""
+
+        if not isinstance(questionnaire, dict) or not questionnaire:
+            raise ValueError("questionnaire must be a non-empty object.")
+        return self._put_optional_object(
+            "/user-profile/questionnaire",
+            json_body=questionnaire,
+        )
+
+    def check_user_can_change_email(self, email: str) -> None:
+        """Check whether an address is eligible for an email-change request."""
+
+        self._request(
+            "POST",
+            "/account/check-user-can-change-email",
+            json_body={"Email": _required(email, "email")},
+        )
+
+    def request_email_change(self, email: str) -> None:
+        """Start an email change and send its confirmation code to ``email``."""
+
+        self._request(
+            "POST",
+            "/account/email-change-request",
+            json_body={"Email": _required(email, "email")},
+        )
+
+    def confirm_email_change(self, code: str) -> None:
+        """Confirm a pending email change with the emailed code."""
+
+        self._request(
+            "POST",
+            "/account/email-change-request/confirm",
+            json_body={"Code": _required(code, "code")},
+        )
+
+    def resend_email_change_confirmation(self) -> None:
+        """Resend a pending email-change confirmation message."""
+
+        self._request("POST", "/account/email-change-request/resend-email")
+
+    def cancel_email_change(self) -> str:
+        """Restore or cancel the pending email change and return Halo's message."""
+
+        value = self._request_json("PUT", "/account/email-change-request")
+        if not isinstance(value, str):
+            raise HaloAPIError("Halo returned an unexpected email-change cancellation response.")
+        return value
+
+    def delete_account(self) -> None:
+        """Permanently delete the authenticated Halo account."""
+
+        self._request("DELETE", "/account")
 
     def beacons(self) -> dict[str, Any] | list[Any]:
         """Return account beacons and the server's available range configuration."""
@@ -1491,6 +1621,15 @@ class HaloClient:
     def _put_object(self, path: str, **kwargs: Any) -> dict[str, Any]:
         return self._mutate_object("PUT", path, **kwargs)
 
+    def _put_optional_object(self, path: str, **kwargs: Any) -> dict[str, Any] | None:
+        response = self._request("PUT", path, **kwargs)
+        if not response.content:
+            return None
+        value = self._decode_json(response)
+        if not isinstance(value, dict):
+            raise HaloAPIError(f"Halo returned an unexpected response for {path}.")
+        return value
+
     def _mutate_object(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         value = self._request_json(method, path, **kwargs)
         if not isinstance(value, dict):
@@ -1653,6 +1792,27 @@ def _positive(value: int, name: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise ValueError(f"{name} must be an integer of at least 1.")
     return value
+
+
+def _nonnegative_integer(value: int, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer.")
+    return value
+
+
+def _onboarding_steps(steps: Sequence[str | dict[str, Any]]) -> list[dict[str, str]]:
+    if isinstance(steps, (str, bytes)) or not isinstance(steps, Sequence):
+        raise ValueError("steps must be a sequence of step IDs or objects.")
+    result = []
+    for index, step in enumerate(steps):
+        if isinstance(step, str):
+            step_id = step
+        elif isinstance(step, dict):
+            step_id = step.get("Id", step.get("id"))
+        else:
+            raise ValueError(f"steps[{index}] must be a step ID or object.")
+        result.append({"Id": _required(step_id, f"steps[{index}].id")})
+    return result
 
 
 def _required_boolean(value: bool, name: str) -> bool:

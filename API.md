@@ -232,7 +232,9 @@ The client does not automatically retry other network failures.
 | `pet_correction_rules(pet_id)` | `dict` | Correction rules configured for one pet. |
 | `training()` | `dict` | Account training-course progress. |
 | `training_course_link(curriculum_id, course_name)` | `str` | One-time external SCORM launch URL. |
-| `user_profile()` | `dict` | Account profile. |
+| `user_profile()` | `dict` | Account profile and read-only completion flags. |
+| `onboarding_progress()` | `dict` | Versioned onboarding-progress record. |
+| `questionnaire()` | `dict` | Saved account questionnaire; an absent questionnaire is an API error. |
 | `beacons()` | `dict \| list` | Registered beacons and available ranges. |
 | `beacon_pet_sync(beacon_id)` | `list[dict]` | One beacon's asynchronous per-pet distribution state. |
 | `subscription()` | `dict \| list` | Subscription, limits, and enabled features. |
@@ -258,6 +260,45 @@ The client does not automatically retry other network failures.
 
 The ecommerce magic code and push device handles are credentials. Parcel data is
 public-record information about real people. Treat all three accordingly.
+
+### Profile, onboarding, questionnaire, and email methods
+
+| Method | Return type | Behavior |
+| --- | --- | --- |
+| `update_profile_name(first_name, last_name)` | `dict \| None` | Replace the profile's first and last name. |
+| `upload_profile_avatar(image, *, filename="avatar.png", content_type="image/png")` | `None` | Upload image bytes as the `icon` multipart field. |
+| `delete_profile_avatar()` | `None` | Remove the current profile avatar. |
+| `update_onboarding_progress(*, version, steps, progress_state)` | `dict` | Save the versioned onboarding DTO and return Halo's normalized response. |
+| `save_questionnaire(questionnaire)` | `dict \| None` | Save a complete PascalCase questionnaire DTO. |
+| `check_user_can_change_email(email)` | `None` | Validate a prospective email address without starting the change. |
+| `request_email_change(email)` | `None` | Send an email-change confirmation code to the new address. |
+| `confirm_email_change(code)` | `None` | Confirm the pending email change. |
+| `resend_email_change_confirmation()` | `None` | Resend the pending confirmation message. |
+| `cancel_email_change()` | `str` | Restore or cancel the pending email change. |
+| `delete_account()` | `None` | Permanently delete the authenticated account. |
+
+`update_profile_name()` is intentionally not a generic profile patch: only
+first and last name are sent. There is also no client setter for
+`hasCompletedQuestionnaire` or `hasFinishedUserGuide`. Saving a questionnaire
+indirectly establishes the former; a successful `questionnaire()` call is the
+reliable completion check. The latter remains response-only state.
+
+`update_onboarding_progress()` requires the version returned by
+`onboarding_progress()`. If Halo reports that the version is out of date,
+reload the progress object and submit the revised DTO instead of blindly
+retrying the stale one. `steps` accepts step ID strings or dictionaries with an
+`Id`/`id`, and the client serializes each item as `{"Id": "..."}`.
+
+`save_questionnaire()` preserves the supplied object so callers can include the
+complete upstream PascalCase `UserQuestionnaireDto`, including current or future
+choice fields. Profile/avatar writes and the email validation, request,
+confirmation, and resend calls may have empty successful responses, so their
+methods return `None`.
+
+Email changes use the normal authenticated session plus the emailed code; the
+client sends no password or step-up credential. After confirmation, refresh
+`user_profile()` to verify the email/current-email value and that
+`hasChangeEmailRequest` is false. Treat `delete_account()` as irreversible.
 
 ### Collar provisioning methods
 
@@ -696,7 +737,20 @@ an HTTP server of its own.
 | `PUT` | `/pet/{id}/unbind-collar` | `unbind_collar_from_pet()` |
 | `GET` | `/account/my/map` | `account_map()`, `geofences()`, `geo_fence_pet_sync()` |
 | `POST` | `/account/mobile-data` | `register_mobile_device()` |
-| `GET` | `/user-profile/` | `user_profile()` |
+| `GET` | `/user-profile` | `user_profile()` |
+| `PUT` | `/user-profile` | `update_profile_name()` |
+| `PUT` | `/user-profile/me/icon` | `upload_profile_avatar()` |
+| `DELETE` | `/user-profile/me/icon` | `delete_profile_avatar()` |
+| `GET` | `/user-profile/onboarding/progress` | `onboarding_progress()` |
+| `PUT` | `/user-profile/onboarding/progress` | `update_onboarding_progress()` |
+| `GET` | `/user-profile/questionnaire` | `questionnaire()` |
+| `PUT` | `/user-profile/questionnaire` | `save_questionnaire()` |
+| `POST` | `/account/check-user-can-change-email` | `check_user_can_change_email()` |
+| `POST` | `/account/email-change-request` | `request_email_change()` |
+| `POST` | `/account/email-change-request/confirm` | `confirm_email_change()` |
+| `POST` | `/account/email-change-request/resend-email` | `resend_email_change_confirmation()` |
+| `PUT` | `/account/email-change-request` | `cancel_email_change()` |
+| `DELETE` | `/account` | `delete_account()` |
 | `GET` | `/beacon/my` | `beacons()`, `beacon_pet_sync()` |
 | `PUT` | `/beacon/check-name-uniqueness` | `beacon_name_is_available()` |
 | `POST` | `/beacon` | `add_beacon()` |

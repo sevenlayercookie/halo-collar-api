@@ -137,6 +137,27 @@ def test_firmware_help_is_read_only(capsys) -> None:
     assert "    cancel" not in out
 
 
+def test_account_help_lists_profile_and_email_commands(capsys) -> None:
+    assert cli.main(["account"]) == 0
+    out = capsys.readouterr().out
+    for verb in (
+        "update-name",
+        "avatar-upload",
+        "avatar-delete",
+        "onboarding",
+        "onboarding-update",
+        "questionnaire",
+        "questionnaire-save",
+        "email-check",
+        "email-request",
+        "email-confirm",
+        "email-resend",
+        "email-cancel",
+        "delete",
+    ):
+        assert verb in out
+
+
 def test_beacon_help_lists_management_commands(capsys) -> None:
     assert cli.main(["beacon"]) == 0
 
@@ -659,6 +680,166 @@ def test_profile_summary_hides_email_avatar_and_referral_link() -> None:
     rendered = json.dumps(summary)
     for secret in ("example.com", "SECRETSIG", "SECRETCODE", "blob.core.windows.net"):
         assert secret not in rendered
+
+
+def test_account_profile_management_handlers(tmp_path, capsys) -> None:
+    avatar = tmp_path / "avatar.jpg"
+    avatar.write_bytes(b"avatar-bytes")
+    progress = tmp_path / "onboarding.json"
+    progress.write_text(
+        json.dumps(
+            {
+                "Version": 3,
+                "Steps": [{"Id": "TheHaloCollarApp"}],
+                "ProgressState": "FullyCompleted",
+            }
+        )
+    )
+    questionnaire = tmp_path / "questionnaire.json"
+    questionnaire.write_text(json.dumps({"HaveTrainedDogsBefore": True}))
+    calls = []
+
+    class FakeClient:
+        def update_profile_name(self, first_name, last_name):
+            calls.append(("name", first_name, last_name))
+            return {"firstName": first_name}
+
+        def upload_profile_avatar(self, image, **kwargs):
+            calls.append(("upload", image, kwargs))
+
+        def delete_profile_avatar(self):
+            calls.append(("avatar-delete",))
+
+        def update_onboarding_progress(self, **kwargs):
+            calls.append(("onboarding", kwargs))
+            return {"version": 4}
+
+        def save_questionnaire(self, value):
+            calls.append(("questionnaire", value))
+            return None
+
+    client = FakeClient()
+    assert (
+        cli._account_update_name(
+            args(first_name="Taylor", last_name="Quinn"),
+            client,
+            Output(),
+        )
+        == 0
+    )
+    assert (
+        cli._account_avatar_upload(
+            args(image_file=str(avatar), content_type="image/jpeg"),
+            client,
+            Output(),
+        )
+        == 0
+    )
+    assert cli._account_avatar_delete(args(yes=True), client, Output()) == 0
+    assert (
+        cli._account_onboarding_update(
+            args(progress_file=str(progress)),
+            client,
+            Output(),
+        )
+        == 0
+    )
+    assert (
+        cli._account_questionnaire_save(
+            args(questionnaire_file=str(questionnaire)),
+            client,
+            Output(),
+        )
+        == 0
+    )
+    assert calls == [
+        ("name", "Taylor", "Quinn"),
+        ("upload", b"avatar-bytes", {"filename": "avatar.jpg", "content_type": "image/jpeg"}),
+        ("avatar-delete",),
+        (
+            "onboarding",
+            {
+                "version": 3,
+                "steps": [{"Id": "TheHaloCollarApp"}],
+                "progress_state": "FullyCompleted",
+            },
+        ),
+        ("questionnaire", {"HaveTrainedDogsBefore": True}),
+    ]
+    assert "Saved onboarding progress" in capsys.readouterr().err
+
+
+def test_account_email_handlers_and_deletion_confirmation(capsys) -> None:
+    calls = []
+
+    class FakeClient:
+        def check_user_can_change_email(self, email):
+            calls.append(("check", email))
+
+        def request_email_change(self, email):
+            calls.append(("request", email))
+
+        def confirm_email_change(self, code):
+            calls.append(("confirm", code))
+
+        def resend_email_change_confirmation(self):
+            calls.append(("resend",))
+
+        def cancel_email_change(self):
+            calls.append(("cancel",))
+            return "cancelled"
+
+        def user_profile(self):
+            return {"currentEmail": "person@example.com"}
+
+        def delete_account(self):
+            calls.append(("delete",))
+
+    client = FakeClient()
+    assert cli._account_email_check(args(email="new@example.com"), client, Output()) == 0
+    assert (
+        cli._account_email_request(
+            args(email="new@example.com", yes=True),
+            client,
+            Output(),
+        )
+        == 0
+    )
+    assert cli._account_email_confirm(args(code="123456", yes=True), client, Output()) == 0
+    assert cli._account_email_resend(args(), client, Output()) == 0
+    assert cli._account_email_cancel(args(yes=True), client, Output(as_json=True)) == 0
+    assert cli._account_delete(args(yes=True), client, Output()) == 0
+    assert calls == [
+        ("check", "new@example.com"),
+        ("request", "new@example.com"),
+        ("confirm", "123456"),
+        ("resend",),
+        ("cancel",),
+        ("delete",),
+    ]
+    assert "Deleted the Halo account" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("handler", "command_args"),
+    [
+        (cli._account_avatar_delete, {}),
+        (cli._account_email_request, {"email": "new@example.com"}),
+        (cli._account_email_confirm, {"code": "123456"}),
+        (cli._account_email_cancel, {}),
+        (cli._account_delete, {}),
+    ],
+)
+def test_account_destructive_profile_commands_need_confirmation(handler, command_args) -> None:
+    class FakeClient:
+        def user_profile(self):
+            return {"email": "person@example.com"}
+
+        def __getattr__(self, _):
+            return lambda *_args, **_kwargs: pytest.fail("profile mutation should not be sent")
+
+    with pytest.raises(ValueError, match="--yes"):
+        handler(args(**command_args, yes=False, no_input=True), FakeClient(), Output())
 
 
 def test_points_require_three_pairs() -> None:

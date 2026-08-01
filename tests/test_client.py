@@ -1246,6 +1246,99 @@ def test_firmware_state_enum_covers_the_proven_wire_values() -> None:
     assert HaloClient.firmware_update_state({"firmwareUpdate": None}) is None
 
 
+def test_profile_and_email_change_routes_use_the_expected_dtos(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET" and request.url.path == "/user-profile":
+            return httpx.Response(200, json={"firstName": "Pat"})
+        if request.method == "PUT" and request.url.path == "/user-profile":
+            return httpx.Response(200, json={"firstName": "Taylor"})
+        if request.method == "GET" and request.url.path == "/user-profile/onboarding/progress":
+            return httpx.Response(200, json={"version": 3, "steps": []})
+        if request.method == "PUT" and request.url.path == "/user-profile/onboarding/progress":
+            return httpx.Response(200, json={"version": 4, "progressState": "fullyCompleted"})
+        if request.method == "GET" and request.url.path == "/user-profile/questionnaire":
+            return httpx.Response(200, json={"haveTrainedDogsBefore": True})
+        if request.method == "PUT" and request.url.path == "/account/email-change-request":
+            return httpx.Response(200, json="cancelled")
+        return httpx.Response(204)
+
+    client = _stub_client(tmp_path, handler)
+    assert client.user_profile() == {"firstName": "Pat"}
+    assert client.update_profile_name("Taylor", "Quinn") == {"firstName": "Taylor"}
+    client.upload_profile_avatar(b"avatar", filename="avatar.jpg", content_type="image/jpeg")
+    client.delete_profile_avatar()
+    assert client.onboarding_progress()["version"] == 3
+    assert client.update_onboarding_progress(
+        version=3,
+        steps=["TheHaloCollarApp"],
+        progress_state="FullyCompleted",
+    )["version"] == 4
+    assert client.questionnaire()["haveTrainedDogsBefore"] is True
+    assert client.save_questionnaire({"HaveTrainedDogsBefore": True}) is None
+    client.check_user_can_change_email("new@example.com")
+    client.request_email_change("new@example.com")
+    client.confirm_email_change("123456")
+    client.resend_email_change_confirmation()
+    assert client.cancel_email_change() == "cancelled"
+    client.delete_account()
+
+    assert [(request.method, request.url.path) for request in requests] == [
+        ("GET", "/user-profile"),
+        ("PUT", "/user-profile"),
+        ("PUT", "/user-profile/me/icon"),
+        ("DELETE", "/user-profile/me/icon"),
+        ("GET", "/user-profile/onboarding/progress"),
+        ("PUT", "/user-profile/onboarding/progress"),
+        ("GET", "/user-profile/questionnaire"),
+        ("PUT", "/user-profile/questionnaire"),
+        ("POST", "/account/check-user-can-change-email"),
+        ("POST", "/account/email-change-request"),
+        ("POST", "/account/email-change-request/confirm"),
+        ("POST", "/account/email-change-request/resend-email"),
+        ("PUT", "/account/email-change-request"),
+        ("DELETE", "/account"),
+    ]
+    assert json.loads(requests[1].content) == {"FirstName": "Taylor", "LastName": "Quinn"}
+    assert b'name="icon"' in requests[2].content
+    assert b'filename="avatar.jpg"' in requests[2].content
+    assert json.loads(requests[5].content) == {
+        "Version": 3,
+        "Steps": [{"Id": "TheHaloCollarApp"}],
+        "ProgressState": "FullyCompleted",
+    }
+    assert json.loads(requests[7].content) == {"HaveTrainedDogsBefore": True}
+    assert json.loads(requests[8].content) == {"Email": "new@example.com"}
+    assert json.loads(requests[9].content) == {"Email": "new@example.com"}
+    assert json.loads(requests[10].content) == {"Code": "123456"}
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda client: client.update_profile_name("", "Quinn"),
+        lambda client: client.update_onboarding_progress(
+            version=-1,
+            steps=[],
+            progress_state="FullyCompleted",
+        ),
+        lambda client: client.update_onboarding_progress(
+            version=1,
+            steps=[{}],
+            progress_state="FullyCompleted",
+        ),
+        lambda client: client.save_questionnaire({}),
+        lambda client: client.confirm_email_change(""),
+    ],
+)
+def test_profile_writes_validate_required_inputs(tmp_path, call) -> None:
+    client = _stub_client(tmp_path, lambda _: pytest.fail("request should not be sent"))
+    with pytest.raises(ValueError):
+        call(client)
+
+
 def test_pet_mode_routes_keep_fences_and_beacons_separate(tmp_path) -> None:
     requests: list[httpx.Request] = []
 
